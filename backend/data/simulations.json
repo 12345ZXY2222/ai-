@@ -1,0 +1,105 @@
+[
+  {
+    "id": "sim-debate-example",
+    "name": "AI 安全辩论（示例）",
+    "description": "一个关于 AI 安全性的三方辩论模拟",
+    "variables": [
+      {"key": "topic", "value": "AI 安全性", "description": "辩论主题"},
+      {"key": "round", "value": "0", "description": "当前轮次"}
+    ],
+    "steps": [
+      {
+        "id": "step-1",
+        "type": "agent",
+        "agent_ids": ["agent-proponent"],
+        "prompt_template": "你是 AI 安全性的支持方。请陈述你的开场观点，说明为什么 AI 安全性至关重要。",
+        "output_var": "opening_argument"
+      },
+      {
+        "id": "step-2",
+        "type": "agent",
+        "agent_ids": ["agent-opponent"],
+        "prompt_template": "你是 AI 安全性的反对方。请反驳支持方的观点：{{state.opening_argument}}",
+        "output_var": "rebuttal"
+      },
+      {
+        "id": "step-3",
+        "type": "loop",
+        "loop_condition": "state.get('round', 0) < 3",
+        "inner_steps": [
+          {
+            "id": "step-3a",
+            "type": "agent",
+            "agent_ids": ["agent-proponent"],
+            "prompt_template": "你是支持方。针对反对方的反驳（{{state.rebuttal}}）进行回应。这是第{{state.round}}轮。",
+            "output_var": "response"
+          },
+          {
+            "id": "step-3b",
+            "type": "agent",
+            "agent_ids": ["agent-opponent"],
+            "prompt_template": "你是反对方。针对支持方的回应（{{state.response}}）进行再反驳。",
+            "output_var": "rebuttal"
+          },
+          {
+            "id": "step-3c",
+            "type": "code",
+            "code_snippet": "state['round'] = state.get('round', 0) + 1"
+          }
+        ]
+      },
+      {
+        "id": "step-4",
+        "type": "agent",
+        "agent_ids": ["agent-judge"],
+        "prompt_template": "你是裁判。请总结辩论双方的观点，并判定获胜方。\n\n支持方观点：{{state.opening_argument}}\n反对方观点：{{state.rebuttal}}",
+        "output_var": "verdict"
+      }
+    ]
+  },
+  {
+    "id": "sim-beer-game",
+    "name": "牛鞭效应模拟（示例）",
+    "description": "供应链中的牛鞭效应演示",
+    "variables": [
+      {"key": "week", "value": "0", "description": "当前周次"},
+      {"key": "customer_demand", "value": "10", "description": "客户实际需求"},
+      {"key": "total_cost", "value": "0", "description": "总成本"}
+    ],
+    "steps": [
+      {
+        "id": "step-1",
+        "type": "agent",
+        "agent_ids": ["agent-retailer"],
+        "prompt_template": "你是零售商。当前是第{{state.week}}周，客户需求是{{state.customer_demand}}。请决定你的订单量。",
+        "output_var": "retailer_order"
+      },
+      {
+        "id": "step-2",
+        "type": "agent",
+        "agent_ids": ["agent-wholesaler"],
+        "prompt_template": "你是批发商。零售商的订单是{{state.retailer_order}}。请决定你向分销商的订单量。",
+        "output_var": "wholesaler_order"
+      },
+      {
+        "id": "step-3",
+        "type": "agent",
+        "agent_ids": ["agent-distributor"],
+        "prompt_template": "你是分销商。批发商的订单是{{state.wholesaler_order}}。请决定你向制造商的订单量。",
+        "output_var": "distributor_order"
+      },
+      {
+        "id": "step-4",
+        "type": "agent",
+        "agent_ids": ["agent-manufacturer"],
+        "prompt_template": "你是制造商。分销商的订单是{{state.distributor_order}}。请决定生产量。",
+        "output_var": "production"
+      },
+      {
+        "id": "step-5",
+        "type": "code",
+        "code_snippet": "state['week'] = state.get('week', 0) + 1; state['total_cost'] = state.get('total_cost', 0) + abs(int(state.get('retailer_order', 0)) - int(state.get('customer_demand', 10))) * 2"
+      }
+    ]
+  }
+]

@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Direct React Test</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; }
+        .success { color: green; font-weight: bold; }
+        .error { color: red; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>Direct React Test (CDN)</h1>
+    <div id="root"></div>
+    
+    <script>
+        console.log('Direct React test starting...');
+        
+        // 检查React是否加载
+        console.log('React global:', window.React);
+        console.log('ReactDOM global:', window.ReactDOM);
+        
+        if (!window.React || !window.ReactDOM) {
+            document.getElementById('root').innerHTML = 
+                '<p class="error">❌ React or ReactDOM not loaded</p>';
+            throw new Error('React CDN not loaded');
+        }
+        
+        const { createElement } = window.React;
+        const { createRoot } = window.ReactDOM;
+        
+        // 创建简单的React应用
+        function SimpleApp() {
+            return createElement('div', null,
+                createElement('h2', null, 'Direct React Working!'),
+                createElement('p', null, 'If you see this, React works directly via CDN.'),
+                createElement('div', { style: { backgroundColor: '#e8f5e9', padding: '15px' } },
+                    createElement('p', { className: 'success' }, '✅ Direct React test successful')
+                )
+            );
+        }
+        
+        const rootElement = document.getElementById('root');
+        if (rootElement) {
+            const root = createRoot(rootElement);
+            root.render(createElement(SimpleApp));
+            console.log('Direct React render successful');
+            
+            // 测试API连接
+            setTimeout(() => testApiConnection(), 1000);
+        } else {
+            console.error('Root element not found');
+        }
+        
+        function testApiConnection() {
+            console.log('Testing API connection...');
+            fetch('/api/paper-reproductions')
+                .then(response => {
+                    if (response.ok) {
+                        console.log('API connected (no auth needed or already authenticated)');
+                        document.getElementById('root').innerHTML += 
+                            '<p style="color: green; margin-top: 20px;">✅ API connected (no auth required or already authenticated)</p>';
+                    } else if (response.status === 401) {
+                        console.log('API requires authentication (401)');
+                        document.getElementById('root').innerHTML += 
+                            '<p style="color: orange; margin-top: 20px;">⚠️ API requires authentication (401) - This is expected</p>';
+                    } else {
+                        console.log('API error:', response.status);
+                        document.getElementById('root').innerHTML += 
+                            '<p style="color: red; margin-top: 20px;">❌ API error: ' + response.status + '</p>';
+                    }
+                })
+                .catch(error => {
+                    console.error('API test failed:', error);
+                    document.getElementById('root').innerHTML += 
+                        '<p style="color: red; margin-top: 20px;">❌ API test failed: ' + error.message + '</p>';
+                });
+        }
+        
+        console.log('Direct React test finished');
+    </script>
+</body>
+</html>

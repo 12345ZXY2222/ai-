@@ -1,0 +1,1982 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Button, Card, Col, Divider, Form, Input, InputNumber, message, Row, Select, Segmented, Space, Switch, Tabs, Typography, theme } from 'antd';
+import { EnvironmentOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
+import type { Agent, SimulationHistoryItem, SimulationStep } from '../api/agent';
+import { createAgent, getAgents, injectMemory, runSimulationStep } from '../api/agent';
+import type { World, WorldColorLabel, WorldIdentity, WorldPOIKind, WorldViewResponse } from '../api/world';
+import { aiGenerateWorld, aiImageWorld, createWorld, createWorldIdentity, createWorldPOI, deleteWorldIdentity, deleteWorldPOI, drawWorld, getWorld, getWorldAscii, getWorldView, listWorlds, moveAgentInWorld, placeAgentInWorld, planPath, planPathToPOI, pickPOIPath, setWorldAgentIdentity, updateWorldIdentity, worldEncounterDialogue } from '../api/world';
+
+const { Text } = Typography;
+
+type Mode = 'paint_wall' | 'paint_color' | 'place_agent' | 'set_target' | 'draw_poi_rect';
+
+const CELL_SIZE = 16;
+
+function isInPath(path: Array<{ x: number; y: number }>, x: number, y: number): boolean {
+  return path.some(p => p.x === x && p.y === y);
+}
+
+const WorldDesigner: React.FC = () => {
+  const { token } = theme.useToken();
+
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [worlds, setWorlds] = useState<World[]>([]);
+  const [world, setWorld] = useState<World | null>(null);
+  const [selectedWorldId, setSelectedWorldId] = useState<string | null>(null);
+
+  const [view, setView] = useState<WorldViewResponse | null>(null);
+  const [viewX, setViewX] = useState(0);
+  const [viewY, setViewY] = useState(0);
+  const [viewW, setViewW] = useState(80);
+  const [viewH, setViewH] = useState(50);
+
+  const [zoom, setZoom] = useState<number>(1);
+  const zoomRef = useRef<number>(1);
+  const [spacePressed, setSpacePressed] = useState(false);
+  const [isPanning, setIsPanning] = useState(false);
+  const panRef = useRef<{
+    active: boolean;
+    startClientX: number;
+    startClientY: number;
+    startViewX: number;
+    startViewY: number;
+    lastDx: number;
+    lastDy: number;
+  }>({
+    active: false,
+    startClientX: 0,
+    startClientY: 0,
+    startViewX: 0,
+    startViewY: 0,
+    lastDx: 0,
+    lastDy: 0,
+  });
+  const [panPx, setPanPx] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const viewBoxRef = useRef<{ x: number; y: number; w: number; h: number }>({ x: 0, y: 0, w: 80, h: 50 });
+
+  const [mode, setMode] = useState<Mode>('paint_wall');
+  const [wallBrush, setWallBrush] = useState<boolean>(true);
+  const [colorBrush, setColorBrush] = useState<WorldColorLabel>('neutral');
+
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [selectedIdentityId, setSelectedIdentityId] = useState<string | null>(null);
+
+  const [poiRectName, setPoiRectName] = useState<string>('');
+  const [poiRectKind, setPoiRectKind] = useState<WorldPOIKind>('custom');
+  const [poiRectLabel, setPoiRectLabel] = useState<WorldColorLabel | null>('neutral');
+  const [poiRectDraft, setPoiRectDraft] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+  const poiRectDraggingRef = useRef(false);
+  const poiRectStartRef = useRef<{ x: number; y: number } | null>(null);
+  const [poiSelectedId, setPoiSelectedId] = useState<string | null>(null);
+
+  const [identityEditorId, setIdentityEditorId] = useState<string | null>(null);
+  const [identityName, setIdentityName] = useState<string>('');
+  const [identityKind, setIdentityKind] = useState<'student' | 'teacher' | 'custom'>('custom');
+  const [identityDescription, setIdentityDescription] = useState<string>('');
+  const [identityScheduleJson, setIdentityScheduleJson] = useState<string>('[]');
+  const [identitySaving, setIdentitySaving] = useState(false);
+
+  const [target, setTarget] = useState<{ x: number; y: number } | null>(null);
+  const [path, setPath] = useState<Array<{ x: number; y: number }>>([]);
+
+  const [creating, setCreating] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const [memAgentId, setMemAgentId] = useState<string | null>(null);
+  const [memText, setMemText] = useState('');
+  const [memImportance, setMemImportance] = useState<number>(3);
+
+  const [dlgInitiator, setDlgInitiator] = useState<string | null>(null);
+  const [dlgPartner, setDlgPartner] = useState<string>('');
+  const [dlgMaxTurns, setDlgMaxTurns] = useState<number>(6);
+  const [dlgEndMarker, setDlgEndMarker] = useState<string>('END_DIALOGUE');
+  const [dlgPrompt, setDlgPrompt] = useState<string>('Start a conversation in this world. When finished, output END_DIALOGUE.');
+  const [dlgOutput, setDlgOutput] = useState<string>('');
+
+  const [aiPrompt, setAiPrompt] = useState<string>('Draw a campus map in the current viewport with semantic color zones: cafeteria=warning, dorm=error, classrooms=info, library=primary, sports field=success, roads/plaza=neutral. Use walls to block buildings but leave walkable paths.');
+  const [aiPipeline, setAiPipeline] = useState<'text' | 'image'>('text');
+
+  const [autoRoam, setAutoRoam] = useState(false);
+  const [bubbleByAgent, setBubbleByAgent] = useState<Record<string, { text: string; expiresAt: number }>>({});
+  const [worldTimeText, setWorldTimeText] = useState<string>('08:00');
+  const roamTickRef = useRef<number | null>(null);
+  const roamTickInFlightRef = useRef(false);
+  const encounterCooldownRef = useRef<Map<string, number>>(new Map());
+  const encounterInFlightRef = useRef<Set<string>>(new Set());
+  const worldClockMsRef = useRef<number>(8 * 60 * 60 * 1000); // 08:00
+  const homeByAgentRef = useRef<Map<string, { x: number; y: number }>>(new Map());
+  const roamIntentByAgentRef = useRef<
+    Map<
+      string,
+      {
+        activity: string;
+        target: { x: number; y: number };
+        path: Array<{ x: number; y: number }>;
+        pathIndex: number;
+        expiresAtMs: number;
+        arrived?: boolean;
+      }
+    >
+  >(new Map());
+  const worldRef = useRef<World | null>(null);
+  const viewRef = useRef<WorldViewResponse | null>(null);
+  const agentsRef = useRef<Agent[]>([]);
+
+  const [worldForm] = Form.useForm();
+  const [agentForm] = Form.useForm();
+
+  useEffect(() => {
+    zoomRef.current = zoom;
+  }, [zoom]);
+
+  useEffect(() => {
+    viewBoxRef.current = { x: viewX, y: viewY, w: viewW, h: viewH };
+  }, [viewX, viewY, viewW, viewH]);
+
+  useEffect(() => {
+    const shouldIgnoreKey = () => {
+      const el = document.activeElement as HTMLElement | null;
+      const tag = (el?.tagName || '').toLowerCase();
+      return tag === 'input' || tag === 'textarea' || (el as any)?.isContentEditable;
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code !== 'Space') return;
+      if (shouldIgnoreKey()) return;
+      e.preventDefault();
+      setSpacePressed(true);
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code !== 'Space') return;
+      setSpacePressed(false);
+    };
+    window.addEventListener('keydown', onKeyDown, { passive: false });
+    window.addEventListener('keyup', onKeyUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown as any);
+      window.removeEventListener('keyup', onKeyUp as any);
+    };
+  }, []);
+
+  const placementsByXY = useMemo(() => {
+    const map = new Map<string, string>();
+    (view?.agent_placements || []).forEach(p => {
+      map.set(`${p.x},${p.y}`, p.agent_id);
+    });
+    return map;
+  }, [view]);
+
+  const agentNameById = useMemo(() => {
+    const m = new Map<string, string>();
+    agents.forEach(a => m.set(a.id, a.name));
+    return m;
+  }, [agents]);
+
+  const poiLabelByXY = useMemo(() => {
+    const m = new Map<string, { short: string; full: string; kind: string }>();
+    const pois = world?.pois || [];
+    for (const p of pois) {
+      const shape = (p as any).shape || 'point';
+      let ax = p.x;
+      let ay = p.y;
+      if (shape === 'cells') {
+        const cells = (p as any).cells || [];
+        if (cells?.length) {
+          ax = Number(cells[0].x);
+          ay = Number(cells[0].y);
+        }
+      }
+      const full = (p.name || '').trim();
+      if (!full) continue;
+      const short = full.length <= 2 ? full : full.slice(0, 2);
+      m.set(`${ax},${ay}`, { short, full, kind: String(p.kind || '') });
+    }
+    return m;
+  }, [world?.pois]);
+
+  const bubbleTextForAgent = (agentId: string | null | undefined) => {
+    if (!agentId) return null;
+    const b = bubbleByAgent[agentId];
+    if (!b) return null;
+    if (Date.now() > b.expiresAt) return null;
+    return b.text;
+  };
+
+  const kindCn = (k: WorldPOIKind) => {
+    if (k === 'cafeteria') return '食堂';
+    if (k === 'dorm') return '寝室';
+    if (k === 'classroom') return '教学楼/教室';
+    if (k === 'library') return '图书馆';
+    if (k === 'office') return '办公室';
+    if (k === 'sports') return '操场/运动区';
+    return '自定义区域';
+  };
+
+  const findPOIAt = (x: number, y: number) => {
+    const wld = worldRef.current;
+    const pois = wld?.pois || [];
+    for (const p of pois) {
+      const shape = (p as any).shape || 'point';
+      if (shape === 'rect') {
+        const w = Number((p as any).w || 0);
+        const h = Number((p as any).h || 0);
+        if (w > 0 && h > 0 && x >= p.x && x < p.x + w && y >= p.y && y < p.y + h) return p;
+      } else if (shape === 'cells') {
+        const cells = (p as any).cells || [];
+        for (let i = 0; i < Math.min(cells.length, 1500); i++) {
+          const c = cells[i];
+          if (c?.x === x && c?.y === y) return p;
+        }
+      } else {
+        if (p.x === x && p.y === y) return p;
+      }
+    }
+    return null;
+  };
+
+  const isInDraftRect = (x: number, y: number) => {
+    if (!poiRectDraft) return false;
+    const x0 = Math.min(poiRectDraft.x0, poiRectDraft.x1);
+    const y0 = Math.min(poiRectDraft.y0, poiRectDraft.y1);
+    const x1 = Math.max(poiRectDraft.x0, poiRectDraft.x1);
+    const y1 = Math.max(poiRectDraft.y0, poiRectDraft.y1);
+    return x >= x0 && x <= x1 && y >= y0 && y <= y1;
+  };
+
+  const toAbs = (xLocal: number, yLocal: number) => {
+    return { x: (view?.x || 0) + xLocal, y: (view?.y || 0) + yLocal };
+  };
+
+  const clampView = (w: World, x: number, y: number, vw: number, vh: number) => {
+    const nx = Math.max(0, Math.min(x, Math.max(0, w.width - 1)));
+    const ny = Math.max(0, Math.min(y, Math.max(0, w.height - 1)));
+    const nw = Math.max(1, Math.min(vw, 200, w.width - nx));
+    const nh = Math.max(1, Math.min(vh, 200, w.height - ny));
+    return { x: nx, y: ny, w: nw, h: nh };
+  };
+
+  const loadView = async (wld: World, x: number, y: number, w: number, h: number) => {
+    const clamped = clampView(wld, x, y, w, h);
+    setViewX(clamped.x);
+    setViewY(clamped.y);
+    setViewW(clamped.w);
+    setViewH(clamped.h);
+    const v = await getWorldView(wld.id, clamped.x, clamped.y, clamped.w, clamped.h);
+    setView(v);
+  };
+
+  const beginPan = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!worldRef.current || !viewRef.current) return false;
+    const wantsPan = spacePressed || e.button === 1 || e.button === 2;
+    if (!wantsPan) return false;
+    panRef.current.active = true;
+    panRef.current.startClientX = e.clientX;
+    panRef.current.startClientY = e.clientY;
+    panRef.current.lastDx = 0;
+    panRef.current.lastDy = 0;
+    panRef.current.startViewX = viewBoxRef.current.x;
+    panRef.current.startViewY = viewBoxRef.current.y;
+    setIsPanning(true);
+    setPanPx({ x: 0, y: 0 });
+    try {
+      (e.currentTarget as any).setPointerCapture?.(e.pointerId);
+    } catch {
+      // ignore
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    return true;
+  };
+
+  const updatePan = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!panRef.current.active) return;
+    const dx = e.clientX - panRef.current.startClientX;
+    const dy = e.clientY - panRef.current.startClientY;
+    panRef.current.lastDx = dx;
+    panRef.current.lastDy = dy;
+    setPanPx({ x: dx, y: dy });
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  const endPan = async (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!panRef.current.active) return;
+    panRef.current.active = false;
+    setIsPanning(false);
+
+    const wld = worldRef.current;
+    if (!wld) {
+      setPanPx({ x: 0, y: 0 });
+      return;
+    }
+
+    const cellPx = CELL_SIZE * (zoomRef.current || 1);
+    const dxCells = cellPx > 0 ? Math.round(panRef.current.lastDx / cellPx) : 0;
+    const dyCells = cellPx > 0 ? Math.round(panRef.current.lastDy / cellPx) : 0;
+
+    // Drag map right -> see more left -> viewX decreases.
+    const nextX = panRef.current.startViewX - dxCells;
+    const nextY = panRef.current.startViewY - dyCells;
+    setPanPx({ x: 0, y: 0 });
+
+    if (nextX !== viewBoxRef.current.x || nextY !== viewBoxRef.current.y) {
+      await loadView(wld, nextX, nextY, viewBoxRef.current.w, viewBoxRef.current.h);
+    }
+
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  const onWheelZoom = (e: React.WheelEvent<HTMLDivElement>) => {
+    if (!worldRef.current || !viewRef.current) return;
+    // Avoid page scrolling while zooming the map.
+    e.preventDefault();
+    e.stopPropagation();
+    const dir = e.deltaY;
+    const factor = dir < 0 ? 1.1 : 0.9;
+    const next = Math.max(0.5, Math.min(3, (zoomRef.current || 1) * factor));
+    setZoom(next);
+  };
+
+  const refreshAll = async () => {
+    setLoading(true);
+    try {
+      const [agentsRes, worldsRes] = await Promise.all([getAgents(), listWorlds()]);
+      setAgents(agentsRes);
+      setWorlds(worldsRes);
+
+      if (selectedWorldId) {
+        const found = worldsRes.find(w => w.id === selectedWorldId);
+        if (!found) {
+          setSelectedWorldId(null);
+          setWorld(null);
+        }
+      }
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || e?.message || 'Refresh failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    refreshAll();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    worldRef.current = world;
+    // keep identity selection stable where possible
+    if (world?.identities?.length) {
+      const ids = new Set(world.identities.map(i => i.id));
+      if (selectedIdentityId && ids.has(selectedIdentityId)) return;
+      setSelectedIdentityId(world.identities[0].id);
+    } else {
+      setSelectedIdentityId(null);
+    }
+  }, [world]);
+
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
+
+  useEffect(() => {
+    if (!world?.identities?.length) {
+      setIdentityEditorId(null);
+      setIdentityName('');
+      setIdentityDescription('');
+      setIdentityKind('custom');
+      setIdentityScheduleJson('[]');
+      return;
+    }
+    const ids = new Set(world.identities.map(i => i.id));
+    const nextId = identityEditorId && ids.has(identityEditorId) ? identityEditorId : world.identities[0].id;
+    setIdentityEditorId(nextId);
+    const it = world.identities.find(i => i.id === nextId);
+    if (it) {
+      setIdentityName(it.name || '');
+      setIdentityKind((it.kind as any) || 'custom');
+      setIdentityDescription(it.description || '');
+      setIdentityScheduleJson(JSON.stringify(it.schedule || [], null, 2));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [world?.id, world?.identities]);
+
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
+
+  useEffect(() => {
+    agentsRef.current = agents;
+  }, [agents]);
+
+  useEffect(() => {
+    if (!autoRoam) {
+      if (roamTickRef.current) {
+        window.clearInterval(roamTickRef.current);
+        roamTickRef.current = null;
+      }
+      return;
+    }
+
+    const tick = async () => {
+      if (roamTickInFlightRef.current) return;
+      roamTickInFlightRef.current = true;
+
+      const w = worldRef.current;
+      const v = viewRef.current;
+      if (!w || !v) {
+        roamTickInFlightRef.current = false;
+        return;
+      }
+
+      try {
+        const WORLD_MS_PER_TICK = 30 * 1000; // 0.9s real-time ~= 30s world-time
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        worldClockMsRef.current = (worldClockMsRef.current + WORLD_MS_PER_TICK) % DAY_MS;
+
+        const hh = Math.floor(worldClockMsRef.current / (60 * 60 * 1000));
+        const mm = Math.floor((worldClockMsRef.current % (60 * 60 * 1000)) / (60 * 1000));
+        const timeText = `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+        setWorldTimeText(timeText);
+
+        const getIdentityFor = (agentId: string): WorldIdentity | null => {
+          const wld = worldRef.current;
+          const identities = wld?.identities || [];
+          const mapping = wld?.agent_identities || {};
+          const identityId = mapping?.[agentId];
+          if (identityId) {
+            const found = identities.find(i => i.id === identityId);
+            if (found) return found;
+          }
+          return null;
+        };
+
+        const getFallbackKind = (agentId: string): 'teacher' | 'student' => {
+          const a = agentsRef.current.find(x => x.id === agentId);
+          const name = (a?.name || agentId || '').toLowerCase();
+          if (name.includes('老师') || name.includes('teacher') || name.includes('prof')) return 'teacher';
+          return 'student';
+        };
+
+        const scheduleFor = (agentId: string, hour: number): { activity: string; poiKinds: WorldPOIKind[] } => {
+          const identity = getIdentityFor(agentId);
+          if (identity?.schedule?.length) {
+            const item = identity.schedule.find(s => hour >= s.start_hour && hour < s.end_hour) || null;
+            if (item) return { activity: item.activity, poiKinds: item.poi_kinds || [] };
+          }
+
+          // fallback (legacy heuristic)
+          const kind = getFallbackKind(agentId);
+          if (kind === 'teacher') {
+            if (hour < 9) return { activity: '去食堂吃早餐/准备授课', poiKinds: ['cafeteria'] };
+            if (hour < 12) return { activity: '去教学楼上课/辅导学生', poiKinds: ['classroom'] };
+            if (hour < 14) return { activity: '去食堂吃午饭/短暂休息', poiKinds: ['cafeteria'] };
+            if (hour < 17) return { activity: '去办公室备课/答疑', poiKinds: ['office', 'library'] };
+            if (hour < 19) return { activity: '去教学楼/图书馆进行研讨', poiKinds: ['classroom', 'library'] };
+            return { activity: '回住处休息/整理教学计划', poiKinds: ['dorm'] };
+          }
+          if (hour < 9) return { activity: '去食堂吃早餐/准备开始一天', poiKinds: ['cafeteria'] };
+          if (hour < 12) return { activity: '去教学楼上课/学习', poiKinds: ['classroom'] };
+          if (hour < 14) return { activity: '去食堂吃午饭/短暂休息', poiKinds: ['cafeteria'] };
+          if (hour < 18) return { activity: '去图书馆自习/做项目', poiKinds: ['library'] };
+          if (hour < 20) return { activity: '去操场运动/散步放松', poiKinds: ['sports'] };
+          return { activity: '回寝室休息/复盘一天', poiKinds: ['dorm'] };
+        };
+
+        const buildNewIntent = async (agentId: string, curX: number, curY: number) => {
+          const sched = scheduleFor(agentId, hh);
+          const activity = sched.activity;
+          const home = homeByAgentRef.current.get(agentId) || { x: curX, y: curY };
+          if (!homeByAgentRef.current.has(agentId)) {
+            homeByAgentRef.current.set(agentId, home);
+          }
+
+          // If it's late, bias to returning "home".
+          const forceHome = activity.startsWith('回寝室') || activity.startsWith('回住处') || activity.startsWith('回宿舍');
+
+          const preferredLabels = (() => {
+            // Legacy label fallback for worlds without named POIs.
+            if (hh < 9) return ['warning'] as const;
+            if (hh < 12) return ['info'] as const;
+            if (hh < 14) return ['warning'] as const;
+            if (hh < 18) return ['primary'] as const;
+            if (hh < 20) return ['success', 'neutral'] as const;
+            return ['error'] as const;
+          })();
+
+          const pickPOIByKind = (): { id: string; kind: WorldPOIKind } | null => {
+            const wld = worldRef.current;
+            const pois = wld?.pois || [];
+            const kinds = sched.poiKinds || [];
+            if (!pois.length || !kinds.length) return null;
+            const matches = pois.filter(p => kinds.includes(p.kind));
+            if (!matches.length) return null;
+            matches.sort((a, b) => (Math.abs(a.x - curX) + Math.abs(a.y - curY)) - (Math.abs(b.x - curX) + Math.abs(b.y - curY)));
+            return { id: matches[0].id, kind: matches[0].kind };
+          };
+
+          // Prefer named POIs + kind-based scheduling first.
+          if (!forceHome) {
+            const chosen = pickPOIByKind();
+            if (chosen) {
+              try {
+                const res = await planPathToPOI(w.id, { agent_id: agentId, poi_id: chosen.id, max_radius: 8 });
+                if (res?.path?.length >= 2) {
+                  return {
+                    activity,
+                    target: { x: res.target.x, y: res.target.y },
+                    path: res.path,
+                    pathIndex: 0,
+                    expiresAtMs: (worldClockMsRef.current + 2 * 60 * 60 * 1000) % DAY_MS,
+                  };
+                }
+              } catch {
+                // fall back
+              }
+            }
+          }
+
+          // Try POI-driven goal first (backend will pick a reachable target near POI cells).
+          if (!forceHome) {
+            try {
+              const res = await pickPOIPath(w.id, {
+                agent_id: agentId,
+                labels: [...preferredLabels],
+                strategy: 'nearest',
+                max_seed_cells: 800,
+                max_attempts: 60,
+                max_radius: 8,
+              });
+              if (res?.path?.length >= 2) {
+                return {
+                  activity,
+                  target: { x: res.target.x, y: res.target.y },
+                  path: res.path,
+                  pathIndex: 0,
+                  // Intent expires in ~2 world-hours.
+                  expiresAtMs: (worldClockMsRef.current + 2 * 60 * 60 * 1000) % DAY_MS,
+                };
+              }
+            } catch {
+              // fall back to random goal + planPath
+            }
+          }
+
+          const tries = 6;
+          for (let attempt = 0; attempt < tries; attempt++) {
+            const tx = forceHome ? home.x : Math.floor(Math.random() * w.width);
+            const ty = forceHome ? home.y : Math.floor(Math.random() * w.height);
+
+            const dist = Math.abs(tx - curX) + Math.abs(ty - curY);
+            if (!forceHome && (dist < 6 || dist > 80)) continue;
+
+            try {
+              const path = await planPath(w.id, agentId, tx, ty);
+              if (!path || path.length < 2) continue;
+              return {
+                activity,
+                target: { x: tx, y: ty },
+                path,
+                pathIndex: 0,
+                // Intent expires in ~2 world-hours.
+                expiresAtMs: (worldClockMsRef.current + 2 * 60 * 60 * 1000) % DAY_MS,
+              };
+            } catch {
+              // try another target
+            }
+          }
+          return null;
+        };
+
+        // Opportunistic bubble cleanup so state doesn't grow forever.
+        const now = Date.now();
+        setBubbleByAgent(prev => {
+          let changed = false;
+          const next: typeof prev = { ...prev };
+          Object.entries(prev).forEach(([k, b]) => {
+            if (now > b.expiresAt) {
+              delete next[k];
+              changed = true;
+            }
+          });
+          return changed ? next : prev;
+        });
+
+        let placementsAll = (w.agent_placements || []) as any[];
+        if (placementsAll.length === 0) return;
+
+        // Ensure each agent has a "home" anchor (their first seen position).
+        placementsAll.forEach(pp => {
+          if (!homeByAgentRef.current.has(pp.agent_id)) {
+            homeByAgentRef.current.set(pp.agent_id, { x: pp.x, y: pp.y });
+          }
+        });
+
+        // Move several agents per tick so the campus feels alive.
+        // Keep this small to avoid hammering the backend.
+        const MAX_MOVES_PER_TICK = 4;
+
+        const occ = new Set(placementsAll.map(pp => `${pp.x},${pp.y}`));
+        const shuffled = [...placementsAll].sort(() => Math.random() - 0.5);
+
+        let movedAny = false;
+        let worldAfterMove: World | null = null;
+
+        for (let k = 0; k < Math.min(MAX_MOVES_PER_TICK, shuffled.length); k++) {
+          const p = shuffled[k];
+          const agentId = p.agent_id;
+          const x = p.x;
+          const y = p.y;
+
+          const currentActivity = scheduleFor(agentId, hh).activity;
+          let intent = roamIntentByAgentRef.current.get(agentId) || null;
+
+          // If schedule activity changed, force replan.
+          if (intent && intent.activity !== currentActivity) {
+            roamIntentByAgentRef.current.delete(agentId);
+            intent = null;
+          }
+
+          // If already arrived, dwell until schedule changes.
+          if (intent?.arrived) {
+            continue;
+          }
+
+          if (!intent) {
+            const created = await buildNewIntent(agentId, x, y);
+            if (created) {
+              roamIntentByAgentRef.current.set(agentId, created);
+              intent = created;
+            }
+          }
+          if (!intent) continue;
+
+          // Mark arrival if already at destination.
+          if (x === intent.target.x && y === intent.target.y) {
+            roamIntentByAgentRef.current.set(agentId, { ...intent, arrived: true });
+            continue;
+          }
+
+          // Advance pathIndex if it points at current position.
+          while (
+            intent.pathIndex < intent.path.length &&
+            intent.path[intent.pathIndex].x === x &&
+            intent.path[intent.pathIndex].y === y
+          ) {
+            intent.pathIndex++;
+          }
+
+          const nextPt = intent.path[intent.pathIndex];
+          if (!nextPt) {
+            roamIntentByAgentRef.current.set(agentId, { ...intent, arrived: true });
+            continue;
+          }
+          if (occ.has(`${nextPt.x},${nextPt.y}`)) continue;
+
+          try {
+            worldAfterMove = await moveAgentInWorld(w.id, agentId, nextPt.x, nextPt.y);
+            movedAny = true;
+
+            // Update occupancy for subsequent moves in this tick.
+            occ.delete(`${x},${y}`);
+            occ.add(`${nextPt.x},${nextPt.y}`);
+
+            roamIntentByAgentRef.current.set(agentId, { ...intent, arrived: false });
+
+            if (worldAfterMove) {
+              placementsAll = (worldAfterMove.agent_placements || []) as any[];
+            }
+          } catch {
+            roamIntentByAgentRef.current.delete(agentId);
+          }
+        }
+
+        // Refresh viewport after successful move; otherwise keep using current view.
+        let v2: WorldViewResponse = v;
+        if (movedAny) {
+          try {
+            if (worldAfterMove) setWorld(worldAfterMove);
+            v2 = await getWorldView(w.id, v.x, v.y, v.width, v.height);
+            setView(v2);
+          } catch {
+            return;
+          }
+        }
+
+        // Detect adjacency (Manhattan distance 1) and request a short dialogue.
+        const ps = v2.agent_placements || [];
+        const MAX_CONCURRENT_ENCOUNTERS = 4;
+
+        const labelAt = (xAbs: number, yAbs: number): WorldColorLabel | null => {
+          const lx = xAbs - v2.x;
+          const ly = yAbs - v2.y;
+          if (lx < 0 || ly < 0 || lx >= v2.width || ly >= v2.height) return null;
+          return (v2.colors?.[ly]?.[lx] as any) || null;
+        };
+
+        const placeHintForLabel = (lbl: WorldColorLabel | null): string => {
+          if (!lbl || lbl === 'none') return '道路/空地';
+          if (lbl === 'warning') return '食堂/餐饮区';
+          if (lbl === 'error') return '寝室/住处附近';
+          if (lbl === 'info') return '教学楼/课堂附近';
+          if (lbl === 'primary') return '图书馆/办公室附近';
+          if (lbl === 'success') return '操场/运动区';
+          if (lbl === 'neutral') return '道路/广场';
+          return '校园里';
+        };
+        for (let i = 0; i < ps.length; i++) {
+          for (let j = i + 1; j < ps.length; j++) {
+            const a = ps[i];
+            const b = ps[j];
+            const dist = Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+            if (dist !== 1) continue;
+
+            const key = [a.agent_id, b.agent_id].sort().join('|');
+            const nextAllowed = encounterCooldownRef.current.get(key) || 0;
+            const t = Date.now();
+            if (t < nextAllowed) continue;
+
+            if (encounterInFlightRef.current.has(key)) continue;
+            if (encounterInFlightRef.current.size >= MAX_CONCURRENT_ENCOUNTERS) return;
+
+            encounterCooldownRef.current.set(key, t + 8000);
+            encounterInFlightRef.current.add(key);
+
+            const aIntent = roamIntentByAgentRef.current.get(a.agent_id);
+            const bIntent = roamIntentByAgentRef.current.get(b.agent_id);
+            const aIdentity = getIdentityFor(a.agent_id);
+            const bIdentity = getIdentityFor(b.agent_id);
+            const aRole = aIdentity?.name || (getFallbackKind(a.agent_id) === 'teacher' ? '老师' : '学生');
+            const bRole = bIdentity?.name || (getFallbackKind(b.agent_id) === 'teacher' ? '老师' : '学生');
+            const aPoi = findPOIAt(a.x, a.y);
+            const bPoi = findPOIAt(b.x, b.y);
+            const place = (() => {
+              if (aPoi) return `${aPoi.name}（${kindCn(aPoi.kind)}）`;
+              if (bPoi) return `${bPoi.name}（${kindCn(bPoi.kind)}）`;
+              return placeHintForLabel(labelAt(a.x, a.y) || labelAt(b.x, b.y));
+            })();
+            const inClassroom = (aPoi?.kind === 'classroom') || (bPoi?.kind === 'classroom');
+            const inCafeteria = (aPoi?.kind === 'cafeteria') || (bPoi?.kind === 'cafeteria');
+            const aKind = (aIdentity?.kind as any) || null;
+            const bKind = (bIdentity?.kind as any) || null;
+            const hasTeacher = aKind === 'teacher' || bKind === 'teacher';
+
+            let topic = `现在是${timeText}，在${place}偶遇。A身份=${aRole}，正在“${aIntent?.activity || '随意走走'}”；B身份=${bRole}，正在“${bIntent?.activity || '随意走走'}”。请用自然口语简短交流，内容要强烈呼应地点/身份/活动（例如教室谈课程与作业、食堂聊饭菜与排队、图书馆聊自习与项目、办公室聊答疑等），2轮内结束。`;
+            let maxTurns = 2;
+
+            // Strongly themed encounters
+            if (inClassroom) {
+              const room = (aPoi?.kind === 'classroom' ? aPoi : bPoi);
+              const roomName = room ? `${room.name}（${kindCn(room.kind)}）` : '教室';
+              if (hasTeacher) {
+                topic = `现在是${timeText}，你们在${roomName}里上课，A=${aRole}，B=${bRole}。请强制进行“课堂互动”：老师点名、提问、讲解要点、布置作业；学生回答并追问一个细节。用简短口语，允许带少量课堂口吻（如“同学们注意”“这题怎么想”）。3轮内结束。`;
+                maxTurns = 3;
+              } else {
+                topic = `现在是${timeText}，你们在${roomName}里上课。请强制进行“课堂互动”：围绕课程内容互相提问/核对笔记/讨论作业要点，最后约定下课后去哪里（例如图书馆/食堂）。用简短口语，3轮内结束。`;
+                maxTurns = 3;
+              }
+            } else if (inCafeteria) {
+              const cafe = (aPoi?.kind === 'cafeteria' ? aPoi : bPoi);
+              const cafeName = cafe ? `${cafe.name}（${kindCn(cafe.kind)}）` : '食堂';
+              topic = `现在是${timeText}，你们在${cafeName}排队打饭/找座位。请强制进行“食堂吐槽/闲聊”：队伍长不长、今天菜怎么样、价格/份量、想吃什么、顺带聊一下接下来上课/作业/午休安排。用简短口语，3轮内结束。`;
+              maxTurns = 3;
+            }
+
+            worldEncounterDialogue(w.id, {
+              agent_a_id: a.agent_id,
+              agent_b_id: b.agent_id,
+              topic,
+              max_turns: maxTurns,
+            })
+              .then(res => {
+                const expiresAt = Date.now() + 5000;
+                setBubbleByAgent(prev => {
+                  const next = { ...prev };
+                  (res.turns || []).forEach(turn => {
+                    next[turn.agent_id] = { text: turn.text, expiresAt };
+                  });
+                  return next;
+                });
+              })
+              .catch(() => {
+                // ignore dialogue errors
+              })
+              .finally(() => {
+                encounterInFlightRef.current.delete(key);
+              });
+
+            return;
+          }
+        }
+      } finally {
+        roamTickInFlightRef.current = false;
+      }
+    };
+
+    roamTickRef.current = window.setInterval(() => {
+      tick();
+    }, 900);
+
+    return () => {
+      if (roamTickRef.current) {
+        window.clearInterval(roamTickRef.current);
+        roamTickRef.current = null;
+      }
+    };
+  }, [autoRoam]);
+
+  useEffect(() => {
+    const run = async () => {
+      if (!selectedWorldId) {
+        setWorld(null);
+        setView(null);
+        return;
+      }
+      try {
+        setLoading(true);
+        const ws = await listWorlds();
+        setWorlds(ws);
+        const w = ws.find(x => x.id === selectedWorldId) || null;
+        setWorld(w);
+        setPath([]);
+        setTarget(null);
+
+        if (w) {
+          // Default: center the viewport (so centered presets like basketball court show up).
+          const cx = Math.max(0, Math.floor((w.width - viewW) / 2));
+          const cy = Math.max(0, Math.floor((w.height - viewH) / 2));
+          await loadView(w, cx, cy, viewW, viewH);
+        } else {
+          setView(null);
+        }
+      } catch (e: any) {
+        message.error(e?.response?.data?.detail || e?.message || 'Failed to load world');
+      } finally {
+        setLoading(false);
+      }
+    };
+    run();
+  }, [selectedWorldId]);
+
+  const colorToBg = (c: WorldColorLabel | null | undefined): string | undefined => {
+    if (!c || c === 'none') return undefined;
+    if (c === 'neutral') return token.colorFillSecondary;
+    if (c === 'primary') return token.colorPrimaryBg;
+    if (c === 'success') return token.colorSuccessBg;
+    if (c === 'warning') return token.colorWarningBg;
+    if (c === 'error') return token.colorErrorBg;
+    if (c === 'info') return token.colorInfoBg;
+    return undefined;
+  };
+
+  const cellStyle = (isWall: boolean, color: WorldColorLabel | null | undefined, hasAgent: boolean, isTarget: boolean, inPath: boolean, inDraft: boolean): React.CSSProperties => {
+    const base: React.CSSProperties = {
+      width: CELL_SIZE,
+      height: CELL_SIZE,
+      padding: 0,
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      border: `1px solid ${token.colorBorderSecondary}`,
+      userSelect: 'none',
+      fontSize: 10,
+      lineHeight: '10px',
+    };
+
+    if (isWall) {
+      base.background = token.colorTextTertiary;
+    } else {
+      base.background = colorToBg(color) || token.colorBgContainer;
+    }
+
+    if (inPath) {
+      base.outline = `2px solid ${token.colorPrimaryBorder}`;
+      base.outlineOffset = -2;
+    }
+    if (inDraft) {
+      base.outline = `2px solid ${token.colorWarningBorder}`;
+      base.outlineOffset = -2;
+    }
+    if (isTarget) {
+      base.outline = `2px solid ${token.colorSuccessBorder}`;
+      base.outlineOffset = -2;
+    }
+    if (hasAgent) {
+      base.fontWeight = 600;
+    }
+
+    return base;
+  };
+
+  const onCellClick = async (x: number, y: number) => {
+    if (!world || !view) return;
+
+    if (mode === 'draw_poi_rect') return;
+
+    const abs = toAbs(x, y);
+
+    if (mode === 'set_target') {
+      setTarget({ x: abs.x, y: abs.y });
+      return;
+    }
+
+    if (mode === 'place_agent') {
+      if (!selectedAgentId) {
+        message.warning('Select an agent first');
+        return;
+      }
+      if (world?.identities?.length && !selectedIdentityId) {
+        message.warning('Select an identity first');
+        return;
+      }
+      try {
+        await placeAgentInWorld(world.id, selectedAgentId, abs.x, abs.y);
+        if (selectedIdentityId) {
+          await setWorldAgentIdentity(world.id, { agent_id: selectedAgentId, identity_id: selectedIdentityId });
+        }
+        const updated = await getWorld(world.id);
+        setWorld(updated);
+        setPath([]);
+        await loadView(updated, viewX, viewY, viewW, viewH);
+        message.success('Agent placed');
+      } catch (e: any) {
+        message.error(e?.response?.data?.detail || e?.message || 'Failed to place agent');
+      }
+      return;
+    }
+
+    // paint walls/colors using draw ops
+    try {
+      const ops =
+        mode === 'paint_wall'
+          ? [{ layer: 'wall' as const, shape: 'cell' as const, x: abs.x, y: abs.y, wall: wallBrush }]
+          : [{ layer: 'color' as const, shape: 'cell' as const, x: abs.x, y: abs.y, color: colorBrush }];
+
+      const nextView = await drawWorld(world.id, { ops, view_x: viewX, view_y: viewY, view_w: viewW, view_h: viewH });
+      setView(nextView);
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || e?.message || 'Failed to paint cell');
+    }
+  };
+
+  const startDrawPOIRect = (absX: number, absY: number) => {
+    if (!world || !view) return;
+    if (mode !== 'draw_poi_rect') return;
+    poiRectDraggingRef.current = true;
+    poiRectStartRef.current = { x: absX, y: absY };
+    setPoiRectDraft({ x0: absX, y0: absY, x1: absX, y1: absY });
+  };
+
+  const updateDrawPOIRect = (absX: number, absY: number) => {
+    if (!poiRectDraggingRef.current) return;
+    const s = poiRectStartRef.current;
+    if (!s) return;
+    setPoiRectDraft({ x0: s.x, y0: s.y, x1: absX, y1: absY });
+  };
+
+  const finishDrawPOIRect = async (absX: number, absY: number) => {
+    if (!world || !view) return;
+    if (!poiRectDraggingRef.current) return;
+    poiRectDraggingRef.current = false;
+
+    const s = poiRectStartRef.current;
+    poiRectStartRef.current = null;
+    if (!s) {
+      setPoiRectDraft(null);
+      return;
+    }
+
+    const x0 = Math.min(s.x, absX);
+    const y0 = Math.min(s.y, absY);
+    const x1 = Math.max(s.x, absX);
+    const y1 = Math.max(s.y, absY);
+    const w = x1 - x0 + 1;
+    const h = y1 - y0 + 1;
+
+    if (!poiRectName.trim()) {
+      message.warning('先在左侧填写 POI 名称，再拖拽框选');
+      setPoiRectDraft(null);
+      return;
+    }
+
+    try {
+      const created = await createWorldPOI(world.id, {
+        name: poiRectName.trim(),
+        kind: poiRectKind,
+        label: poiRectLabel,
+        shape: 'rect',
+        x: x0,
+        y: y0,
+        w,
+        h,
+        description: null,
+      } as any);
+      setPoiSelectedId(created.id);
+      const updated = await getWorld(world.id);
+      setWorld(updated);
+      await loadView(updated, viewX, viewY, viewW, viewH);
+      message.success('已创建 POI 区域');
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || e?.message || '创建 POI 区域失败');
+    } finally {
+      setPoiRectDraft(null);
+    }
+  };
+
+  const doCreateWorld = async (values: any) => {
+    setCreating(true);
+    try {
+      const created = await createWorld({
+        name: values.name,
+        width: values.width,
+        height: values.height,
+        preset: values.preset || null,
+      });
+      await refreshAll();
+      setSelectedWorldId(created.id);
+      message.success('World created');
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || e?.message || 'Create world failed');
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const doCreateAgent = async (values: any) => {
+    setCreating(true);
+    try {
+      const created = await createAgent({
+        name: values.name,
+        provider: values.provider,
+        model: values.model,
+        persona: values.persona || undefined,
+        base_url: values.base_url || undefined,
+        usage_example: values.usage_example || undefined,
+        long_term_memory: [],
+      } as any);
+      await refreshAll();
+      setSelectedAgentId(created.id);
+      setMemAgentId(created.id);
+      setDlgInitiator(created.id);
+      message.success('Agent created');
+      agentForm.resetFields(['name']);
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || e?.message || 'Create agent failed');
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const doInjectMemory = async () => {
+    if (!memAgentId) {
+      message.warning('Select memory target agent');
+      return;
+    }
+    if (!memText.trim()) {
+      message.warning('Enter memory content');
+      return;
+    }
+    try {
+      await injectMemory(memAgentId, memText, memImportance);
+      message.success('Memory injected');
+      setMemText('');
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || e?.message || 'Inject memory failed');
+    }
+  };
+
+  const doPlanPath = async (agentId: string) => {
+    if (!world) {
+      message.warning('Select a world first');
+      return;
+    }
+    if (!target) {
+      message.warning('Set a target cell first');
+      return;
+    }
+    try {
+      const pts = await planPath(world.id, agentId, target.x, target.y);
+      setPath(pts);
+      message.success(`Path length: ${pts.length}`);
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || e?.message || 'Plan path failed');
+    }
+  };
+
+  const doMoveToTarget = async (agentId: string) => {
+    if (!world) {
+      message.warning('Select a world first');
+      return;
+    }
+    if (!target) {
+      message.warning('Set a target cell first');
+      return;
+    }
+    try {
+      const updated = await moveAgentInWorld(world.id, agentId, target.x, target.y);
+      setWorld(updated);
+      setPath([]);
+      if (view) {
+        await loadView(updated, viewX, viewY, viewW, viewH);
+      }
+      message.success('Agent moved');
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || e?.message || 'Move failed');
+    }
+  };
+
+  const doSaveIdentity = async () => {
+    if (!world) {
+      message.warning('Select a world first');
+      return;
+    }
+    if (!identityEditorId) {
+      message.warning('Select an identity to edit');
+      return;
+    }
+    if (!identityName.trim()) {
+      message.warning('Identity name is required');
+      return;
+    }
+
+    let schedule: any[] = [];
+    try {
+      const parsed = JSON.parse(identityScheduleJson || '[]');
+      if (!Array.isArray(parsed)) throw new Error('Schedule must be a JSON array');
+      schedule = parsed;
+    } catch (e: any) {
+      message.error(e?.message || 'Invalid schedule JSON');
+      return;
+    }
+
+    setIdentitySaving(true);
+    try {
+      await updateWorldIdentity(world.id, identityEditorId, {
+        name: identityName,
+        kind: identityKind,
+        description: identityDescription || null,
+        schedule,
+      } as any);
+      const updated = await getWorld(world.id);
+      setWorld(updated);
+      message.success('Identity saved');
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || e?.message || 'Save identity failed');
+    } finally {
+      setIdentitySaving(false);
+    }
+  };
+
+  const doCreateIdentity = async () => {
+    if (!world) {
+      message.warning('Select a world first');
+      return;
+    }
+    setIdentitySaving(true);
+    try {
+      const created = await createWorldIdentity(world.id, {
+        name: 'New Identity',
+        kind: 'custom',
+        description: '',
+        schedule: [],
+      } as any);
+      const updated = await getWorld(world.id);
+      setWorld(updated);
+      setIdentityEditorId(created.id);
+      message.success('Identity created');
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || e?.message || 'Create identity failed');
+    } finally {
+      setIdentitySaving(false);
+    }
+  };
+
+  const doDeleteIdentity = async () => {
+    if (!world) {
+      message.warning('Select a world first');
+      return;
+    }
+    if (!identityEditorId) {
+      message.warning('Select an identity to delete');
+      return;
+    }
+    setIdentitySaving(true);
+    try {
+      await deleteWorldIdentity(world.id, identityEditorId);
+      const updated = await getWorld(world.id);
+      setWorld(updated);
+      message.success('Identity deleted');
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || e?.message || 'Delete identity failed');
+    } finally {
+      setIdentitySaving(false);
+    }
+  };
+
+  const doAIDraw = async (prompt: string) => {
+    if (!world || !view) {
+      message.warning('Select a world first');
+      return;
+    }
+    if (!prompt.trim()) {
+      message.warning('请输入提示词');
+      return;
+    }
+    try {
+      setCreating(true);
+      if (aiPipeline === 'image') {
+        const res = await aiImageWorld(world.id, {
+          prompt,
+          x: view.x,
+          y: view.y,
+          w: view.width,
+          h: view.height,
+        });
+        setView(res.view);
+        message.success('AI 完成：文生图→网格 已应用到当前 viewport');
+      } else {
+        const res = await aiGenerateWorld(world.id, {
+          prompt,
+          x: view.x,
+          y: view.y,
+          w: view.width,
+          h: view.height,
+          mode: 'auto',
+          max_commands: 40,
+          max_cells: 20000,
+          max_ops: 400,
+        });
+        setView(res.view);
+        const cmdN = res.commands?.length || 0;
+        const opN = res.ops?.length || 0;
+        if (!cmdN && !opN) {
+          message.warning('AI 没有产生任何有效绘制动作：请确认 viewport 位置，并明确要求在 viewport 内绘制（建议用“随机/棋盘格/填充矩形”等描述）。');
+        } else {
+          message.success(`AI 完成：commands=${cmdN}, ops=${opN}`);
+        }
+      }
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || e?.message || 'AI 绘制失败');
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const doRandomizeRedBlue = async () => {
+    if (!world || !view) {
+      message.warning('Select a world first');
+      return;
+    }
+    try {
+      setCreating(true);
+
+      const blues: Array<{ x: number; y: number }> = [];
+      const reds: Array<{ x: number; y: number }> = [];
+
+      for (let yLocal = 0; yLocal < view.height; yLocal++) {
+        for (let xLocal = 0; xLocal < view.width; xLocal++) {
+          if (view.walls?.[yLocal]?.[xLocal]) continue;
+          const x = view.x + xLocal;
+          const y = view.y + yLocal;
+          if (Math.random() < 0.5) {
+            blues.push({ x, y });
+          } else {
+            reds.push({ x, y });
+          }
+        }
+      }
+
+      const ops: any[] = [
+        // Clear colors in the viewport first
+        { layer: 'color', shape: 'rect', x: view.x, y: view.y, x2: view.x + view.width - 1, y2: view.y + view.height - 1, color: 'none' },
+      ];
+      if (blues.length) ops.push({ layer: 'color', shape: 'cells', cells: blues, color: 'primary' }); // blue-ish
+      if (reds.length) ops.push({ layer: 'color', shape: 'cells', cells: reds, color: 'error' }); // red-ish
+
+      const nextView = await drawWorld(world.id, { ops, view_x: view.x, view_y: view.y, view_w: view.width, view_h: view.height });
+      setView(nextView);
+      message.success(`Randomized: blue=${blues.length}, red=${reds.length}`);
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || e?.message || 'Randomize failed');
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  // Unified AI entry uses ai_generate (multi-role collaboration) now.
+
+  const doDialogue = async () => {
+    if (!world) {
+      message.warning('Select a world first');
+      return;
+    }
+    if (!dlgInitiator) {
+      message.warning('Select initiator');
+      return;
+    }
+
+    try {
+      setCreating(true);
+      const ascii = await getWorldAscii(world.id);
+
+      const step: SimulationStep = {
+        id: 'dialogue-1',
+        type: 'dialogue',
+        agent_ids: [dlgInitiator],
+        prompt_template: `World map (ascii):\n${ascii}\n\nYou are an agent in this grid world. You know walls (#) and open cells.\n${dlgPrompt}`,
+        dialogue_max_turns: dlgMaxTurns,
+        dialogue_auto_partner: !dlgPartner,
+        dialogue_partner_id: dlgPartner || undefined,
+        dialogue_end_marker: dlgEndMarker,
+        output_var: 'dialogue_transcript',
+      };
+
+      const world_state = {
+        world_id: world.id,
+        world_ascii: ascii,
+        world,
+      };
+
+      const res = await runSimulationStep([step], 0, [] as SimulationHistoryItem[], world_state);
+      const items = res.new_history_items || [];
+      const lines = items.map(it => `${it.agent_name}: ${it.content}`);
+      setDlgOutput(lines.join('\n'));
+      message.success('Dialogue executed');
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || e?.message || 'Dialogue failed');
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const worldOptions = useMemo(() => worlds.map(w => ({ label: w.name, value: w.id })), [worlds]);
+  const agentOptions = useMemo(() => agents.map(a => ({ label: a.name, value: a.id })), [agents]);
+
+  return (
+    <div style={{ maxWidth: 1400, margin: '0 auto' }}>
+      <Card
+        title={<Space><EnvironmentOutlined /> World</Space>}
+        extra={
+          <Space wrap>
+            <Button icon={<ReloadOutlined />} onClick={refreshAll} loading={loading}>Refresh</Button>
+          </Space>
+        }
+        style={{ marginBottom: 16 }}
+      >
+        <Row gutter={[16, 16]}>
+          <Col xs={24} md={14}>
+            <Space direction="vertical" style={{ width: '100%' }} size="middle">
+              <Card size="small" title="Select / Create World">
+                <Space direction="vertical" style={{ width: '100%' }} size="middle">
+                  <Select
+                    placeholder="Select a world"
+                    options={worldOptions}
+                    value={selectedWorldId || undefined}
+                    onChange={v => setSelectedWorldId(v)}
+                    allowClear
+                    style={{ width: '100%' }}
+                  />
+
+                  <Form
+                    form={worldForm}
+                    layout="inline"
+                    onFinish={doCreateWorld}
+                    initialValues={{ name: 'Campus', width: 200, height: 150, preset: 'campus' }}
+                  >
+                    <Form.Item name="name" rules={[{ required: true, message: 'World name required' }]}>
+                      <Input placeholder="World name" style={{ width: 200 }} />
+                    </Form.Item>
+                    <Form.Item name="width" rules={[{ required: true }]}>
+                      <InputNumber min={5} max={1000} style={{ width: 100 }} />
+                    </Form.Item>
+                    <Form.Item name="height" rules={[{ required: true }]}>
+                      <InputNumber min={5} max={1000} style={{ width: 100 }} />
+                    </Form.Item>
+                    <Form.Item name="preset">
+                      <Select style={{ width: 180 }} options={[
+                        { label: 'Basketball Court', value: 'basketball_court' },
+                        { label: 'Soccer Field', value: 'soccer_field' },
+                        { label: 'Campus', value: 'campus' },
+                        { label: 'Empty', value: '' },
+                      ]} />
+                    </Form.Item>
+                    <Form.Item>
+                      <Button type="primary" htmlType="submit" icon={<PlusOutlined />} loading={creating}>Create</Button>
+                    </Form.Item>
+                  </Form>
+                </Space>
+              </Card>
+
+              <Card size="small" title="Tools">
+                <Space direction="vertical" style={{ width: '100%' }} size="middle">
+                  <div>
+                    <Text strong>Auto Roam & Chat</Text>
+                    <div style={{ marginTop: 8 }}>
+                      <Space>
+                        <Button
+                          type={autoRoam ? 'default' : 'primary'}
+                          onClick={() => setAutoRoam(v => !v)}
+                          disabled={!world || !view}
+                        >
+                          {autoRoam ? 'Stop' : 'Start'}
+                        </Button>
+                        <Switch checked={autoRoam} onChange={setAutoRoam} disabled={!world || !view} />
+                      </Space>
+                    </div>
+                  </div>
+
+                  <div>
+                    <Text strong>Mode</Text>
+                    <div style={{ marginTop: 8 }}>
+
+                      {mode === 'paint_color' && (
+                        <div>
+                          <Text strong>POI Color Legend</Text>
+                          <div style={{ marginTop: 8 }}>
+                            <Space wrap>
+                              <Button size="small" onClick={() => setColorBrush('warning')}>食堂 (warning)</Button>
+                              <Button size="small" onClick={() => setColorBrush('error')}>寝室 (error)</Button>
+                              <Button size="small" onClick={() => setColorBrush('info')}>教学楼 (info)</Button>
+                              <Button size="small" onClick={() => setColorBrush('primary')}>图书馆 (primary)</Button>
+                              <Button size="small" onClick={() => setColorBrush('success')}>操场 (success)</Button>
+                              <Button size="small" onClick={() => setColorBrush('neutral')}>道路/广场 (neutral)</Button>
+                              <Button size="small" onClick={() => setColorBrush('none')}>清除 (none)</Button>
+                            </Space>
+                          </div>
+                        </div>
+                      )}
+                      <Segmented
+                        block
+                        value={mode}
+                        options={[
+                          { label: 'Paint Wall', value: 'paint_wall' },
+                          { label: 'Paint Color', value: 'paint_color' },
+                          { label: 'Place Agent', value: 'place_agent' },
+                          { label: 'Set Target', value: 'set_target' },
+                          { label: 'Draw POI Rect', value: 'draw_poi_rect' },
+                        ]}
+                        onChange={(v) => setMode(v as Mode)}
+                      />
+                    </div>
+                  </div>
+
+                  {mode === 'draw_poi_rect' && (
+                    <>
+                      <Divider style={{ margin: '8px 0' }} />
+                      <Text strong>POI 区域（矩形）</Text>
+                      <Space direction="vertical" style={{ width: '100%', marginTop: 8 }} size="small">
+                        <Input value={poiRectName} onChange={e => setPoiRectName(e.target.value)} placeholder="POI 名称（必填）" />
+                        <Select
+                          value={poiRectKind}
+                          onChange={(v) => setPoiRectKind(v as any)}
+                          style={{ width: '100%' }}
+                          options={[
+                            { label: 'custom', value: 'custom' },
+                            { label: 'cafeteria', value: 'cafeteria' },
+                            { label: 'dorm', value: 'dorm' },
+                            { label: 'classroom', value: 'classroom' },
+                            { label: 'library', value: 'library' },
+                            { label: 'office', value: 'office' },
+                            { label: 'sports', value: 'sports' },
+                          ]}
+                        />
+                        <Select
+                          value={poiRectLabel as any}
+                          onChange={(v) => setPoiRectLabel((v as any) || null)}
+                          style={{ width: '100%' }}
+                          options={[
+                            { label: 'none', value: 'none' },
+                            { label: 'neutral', value: 'neutral' },
+                            { label: 'primary', value: 'primary' },
+                            { label: 'success', value: 'success' },
+                            { label: 'warning', value: 'warning' },
+                            { label: 'error', value: 'error' },
+                            { label: 'info', value: 'info' },
+                          ]}
+                        />
+                        <Text type="secondary">在网格上按住并拖拽：创建矩形 POI 区域。</Text>
+
+                        {(world?.pois || []).length ? (
+                          <>
+                            <Select
+                              placeholder="选择一个 POI（可删除）"
+                              value={poiSelectedId || undefined}
+                              onChange={(v) => setPoiSelectedId(v)}
+                              allowClear
+                              style={{ width: '100%' }}
+                              options={(world?.pois || []).map(p => ({
+                                label: `${p.name} (${p.kind}) ${(p as any).shape || 'point'}`,
+                                value: p.id,
+                              }))}
+                            />
+                            <Button
+                              danger
+                              disabled={!world || !poiSelectedId}
+                              onClick={async () => {
+                                if (!world || !poiSelectedId) return;
+                                try {
+                                  await deleteWorldPOI(world.id, poiSelectedId);
+                                  const updated = await getWorld(world.id);
+                                  setWorld(updated);
+                                  await loadView(updated, viewX, viewY, viewW, viewH);
+                                  setPoiSelectedId(null);
+                                  message.success('已删除 POI');
+                                } catch (e: any) {
+                                  message.error(e?.response?.data?.detail || e?.message || '删除 POI 失败');
+                                }
+                              }}
+                              block
+                            >
+                              Delete POI
+                            </Button>
+                          </>
+                        ) : null}
+                      </Space>
+                    </>
+                  )}
+
+                  <div>
+                    <Text strong>Wall Brush</Text>
+                    <div style={{ marginTop: 8 }}>
+                      <Segmented
+                        block
+                        value={wallBrush ? 'add' : 'erase'}
+                        options={[
+                          { label: 'Add', value: 'add' },
+                          { label: 'Erase', value: 'erase' },
+                        ]}
+                        onChange={(v) => setWallBrush(v === 'add')}
+                        disabled={mode !== 'paint_wall'}
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <Text strong>Color Brush</Text>
+                    <div style={{ marginTop: 8 }}>
+                      <Select
+                        value={colorBrush}
+                        onChange={(v) => setColorBrush(v)}
+                        style={{ width: '100%' }}
+                        disabled={mode !== 'paint_color'}
+                        options={[
+                          { label: 'none (clear)', value: 'none' },
+                          { label: 'neutral', value: 'neutral' },
+                          { label: 'primary', value: 'primary' },
+                          { label: 'success', value: 'success' },
+                          { label: 'warning', value: 'warning' },
+                          { label: 'error', value: 'error' },
+                          { label: 'info', value: 'info' },
+                        ]}
+                      />
+                    </div>
+                  </div>
+
+                  <Divider style={{ margin: '8px 0' }} />
+                  <Text strong>Viewport</Text>
+                  <Row gutter={8}>
+                    <Col span={12}>
+                      <InputNumber value={viewX} min={0} onChange={(v) => setViewX(Number(v || 0))} style={{ width: '100%' }} addonBefore="X" />
+                    </Col>
+                    <Col span={12}>
+                      <InputNumber value={viewY} min={0} onChange={(v) => setViewY(Number(v || 0))} style={{ width: '100%' }} addonBefore="Y" />
+                    </Col>
+                  </Row>
+                  <Row gutter={8}>
+                    <Col span={12}>
+                      <InputNumber value={viewW} min={1} max={200} onChange={(v) => setViewW(Number(v || 1))} style={{ width: '100%' }} addonBefore="W" />
+                    </Col>
+                    <Col span={12}>
+                      <InputNumber value={viewH} min={1} max={200} onChange={(v) => setViewH(Number(v || 1))} style={{ width: '100%' }} addonBefore="H" />
+                    </Col>
+                  </Row>
+                  <Button
+                    onClick={async () => {
+                      if (!world) return;
+                      try {
+                        setLoading(true);
+                        await loadView(world, viewX, viewY, viewW, viewH);
+                      } catch (e: any) {
+                        message.error(e?.response?.data?.detail || e?.message || 'Load viewport failed');
+                      } finally {
+                        setLoading(false);
+                      }
+                    }}
+                    disabled={!world}
+                    block
+                  >
+                    Load View
+                  </Button>
+
+                  <Text type="secondary">Legend: wall, color, agent, target, path</Text>
+                </Space>
+              </Card>
+            </Space>
+          </Col>
+
+          <Col xs={24} md={10}>
+            <Space direction="vertical" style={{ width: '100%' }} size="middle">
+              <Card size="small" title="Agents">
+                <Tabs
+                  items={[
+                    {
+                      key: 'select',
+                      label: 'Select',
+                      children: (
+                        <Space direction="vertical" style={{ width: '100%' }} size="middle">
+                          <Select
+                            placeholder="Select agent"
+                            options={agentOptions}
+                            value={selectedAgentId || undefined}
+                            onChange={v => setSelectedAgentId(v)}
+                            allowClear
+                            style={{ width: '100%' }}
+                          />
+                          {world?.identities?.length ? (
+                            <>
+                              <Select
+                                placeholder="Select identity (required for placement)"
+                                options={(world.identities || []).map(i => ({ label: `${i.name} (${i.kind})`, value: i.id }))}
+                                value={selectedIdentityId || undefined}
+                                onChange={v => setSelectedIdentityId(v)}
+                                allowClear
+                                style={{ width: '100%' }}
+                              />
+                              <Text type="secondary">Identity is assigned when placing an agent into the world.</Text>
+                            </>
+                          ) : null}
+                          <Text type="secondary">Used for “Place Agent” mode and path operations.</Text>
+                        </Space>
+                      ),
+                    },
+                    {
+                      key: 'create',
+                      label: 'Create',
+                      children: (
+                        <Form
+                          form={agentForm}
+                          layout="vertical"
+                          onFinish={doCreateAgent}
+                          initialValues={{ provider: 'deepseek', model: 'deepseek-chat' }}
+                        >
+                          <Form.Item name="name" label="Name" rules={[{ required: true }]}>
+                            <Input placeholder="Agent name" />
+                          </Form.Item>
+                          <Form.Item name="provider" label="Provider" rules={[{ required: true }]}>
+                            <Select options={[
+                              { label: 'deepseek', value: 'deepseek' },
+                              { label: 'zhipu', value: 'zhipu' },
+                              { label: 'custom', value: 'custom' },
+                            ]} />
+                          </Form.Item>
+                          <Form.Item name="model" label="Model" rules={[{ required: true }]}>
+                            <Input placeholder="e.g. deepseek-chat" />
+                          </Form.Item>
+                          <Form.Item name="persona" label="Persona">
+                            <Input.TextArea rows={3} placeholder="System prompt / role" />
+                          </Form.Item>
+                          <Button type="primary" htmlType="submit" loading={creating} block>Create Agent</Button>
+                        </Form>
+                      ),
+                    },
+                  ]}
+                />
+              </Card>
+
+              <Card size="small" title="Identities">
+                {!world ? (
+                  <Text type="secondary">Select a world to edit identities.</Text>
+                ) : !(world.identities || []).length ? (
+                  <Space direction="vertical" style={{ width: '100%' }} size="middle">
+                    <Text type="secondary">This world has no identities yet.</Text>
+                    <Button onClick={doCreateIdentity} loading={identitySaving} block>Create Identity</Button>
+                  </Space>
+                ) : (
+                  <Space direction="vertical" style={{ width: '100%' }} size="middle">
+                    <Select
+                      value={identityEditorId || undefined}
+                      onChange={(v) => {
+                        setIdentityEditorId(v);
+                        const it = (world.identities || []).find(i => i.id === v);
+                        if (it) {
+                          setIdentityName(it.name || '');
+                          setIdentityKind((it.kind as any) || 'custom');
+                          setIdentityDescription(it.description || '');
+                          setIdentityScheduleJson(JSON.stringify(it.schedule || [], null, 2));
+                        }
+                      }}
+                      options={(world.identities || []).map(i => ({ label: `${i.name} (${i.kind})`, value: i.id }))}
+                      style={{ width: '100%' }}
+                    />
+                    <Input value={identityName} onChange={e => setIdentityName(e.target.value)} placeholder="Identity name" />
+                    <Select
+                      value={identityKind}
+                      onChange={v => setIdentityKind(v)}
+                      options={[
+                        { label: 'student', value: 'student' },
+                        { label: 'teacher', value: 'teacher' },
+                        { label: 'custom', value: 'custom' },
+                      ]}
+                      style={{ width: '100%' }}
+                    />
+                    <Input
+                      value={identityDescription}
+                      onChange={e => setIdentityDescription(e.target.value)}
+                      placeholder="Description (optional)"
+                    />
+                    <Input.TextArea
+                      value={identityScheduleJson}
+                      onChange={e => setIdentityScheduleJson(e.target.value)}
+                      rows={8}
+                      placeholder='Schedule JSON array: [{"start_hour":9,"end_hour":12,"activity":"上课","poi_kinds":["classroom"]}]'
+                    />
+                    <Row gutter={8}>
+                      <Col span={12}>
+                        <Button onClick={doCreateIdentity} loading={identitySaving} block>New</Button>
+                      </Col>
+                      <Col span={12}>
+                        <Button danger onClick={doDeleteIdentity} loading={identitySaving} block>Delete</Button>
+                      </Col>
+                    </Row>
+                    <Button type="primary" onClick={doSaveIdentity} loading={identitySaving} block>Save</Button>
+                    <Text type="secondary">Auto-roam uses identity schedule poi_kinds when available.</Text>
+                  </Space>
+                )}
+              </Card>
+            </Space>
+          </Col>
+        </Row>
+      </Card>
+
+      <Row gutter={[16, 16]}>
+        <Col xs={24} lg={16}>
+          <Card title={`Grid (World Time ${worldTimeText})`} bodyStyle={{ padding: 12 }}>
+            {!world ? (
+              <Text type="secondary">Select or create a world to start.</Text>
+            ) : !view ? (
+              <Text type="secondary">Loading viewport...</Text>
+            ) : (
+              <div
+                onPointerDownCapture={e => {
+                  // Pan: Space+drag (recommended), or middle/right drag.
+                  beginPan(e);
+                }}
+                onPointerMove={updatePan}
+                onPointerUp={endPan}
+                onPointerCancel={endPan}
+                onContextMenu={e => {
+                  // Prevent browser context menu so right-drag can pan.
+                  e.preventDefault();
+                }}
+                onWheel={onWheelZoom}
+                style={{
+                  position: 'relative',
+                  overflow: 'hidden',
+                  width: '100%',
+                  height: '70vh',
+                  minHeight: 360,
+                  border: `1px solid ${token.colorBorderSecondary}`,
+                  borderRadius: 8,
+                  background: token.colorBgContainer,
+                  touchAction: 'none',
+                  userSelect: 'none',
+                  cursor: isPanning ? 'grabbing' : spacePressed ? 'grab' : 'default',
+                }}
+                title={spacePressed ? 'Drag to pan (Space held). Wheel to zoom.' : 'Hold Space and drag to pan. Wheel to zoom.'}
+              >
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: `repeat(${view.width}, ${CELL_SIZE}px)`,
+                    gap: 0,
+                    width: view.width * CELL_SIZE,
+                    transform: `translate(${panPx.x}px, ${panPx.y}px) scale(${zoom})`,
+                    transformOrigin: '0 0',
+                    willChange: 'transform',
+                    pointerEvents: spacePressed || isPanning ? 'none' : 'auto',
+                  }}
+                >
+                  {view.walls.map((row, yLocal) =>
+                    row.map((isWall, xLocal) => {
+                      const abs = toAbs(xLocal, yLocal);
+                      const agentAt = placementsByXY.get(`${abs.x},${abs.y}`);
+                      const isTarget = !!target && target.x === abs.x && target.y === abs.y;
+                      const inPath = isInPath(path, abs.x, abs.y);
+                      const agentInitial = agentAt ? ((agentNameById.get(agentAt) || agentAt || 'A').trim().slice(0, 1) || 'A') : '';
+                      const poiLabel = poiLabelByXY.get(`${abs.x},${abs.y}`);
+                      const label = agentAt ? agentInitial : isTarget ? 'T' : inPath ? '•' : (poiLabel?.short || '');
+                      const c = view.colors?.[yLocal]?.[xLocal] || null;
+                      const bubbleText = bubbleTextForAgent(agentAt);
+                      const agentName = agentAt ? (agentNameById.get(agentAt) || agentAt) : '';
+                      const intent = agentAt ? roamIntentByAgentRef.current.get(agentAt) : null;
+                      const agentIdentity = (() => {
+                        if (!agentAt) return null;
+                        const identityId = (world?.agent_identities as any)?.[agentAt];
+                        const identities = world?.identities || [];
+                        return identities.find(i => i.id === identityId) || null;
+                      })();
+                      const poiHere = agentAt ? findPOIAt(abs.x, abs.y) : null;
+                      const placeText = poiHere ? `${poiHere.name}（${kindCn(poiHere.kind as any)}）` : '（非 POI 区域）';
+                      const activityText = intent?.activity || '随意走走';
+                      const identityText = agentIdentity?.name || '';
+
+                      return (
+                        <div key={`${abs.x}-${abs.y}`} style={{ position: 'relative', width: CELL_SIZE, height: CELL_SIZE }}>
+                          {bubbleText && (
+                            <div
+                              style={{
+                                position: 'absolute',
+                                left: '50%',
+                                bottom: CELL_SIZE + 4,
+                                transform: 'translateX(-50%)',
+                                maxWidth: 200,
+                                padding: '4px 6px',
+                                border: `1px solid ${token.colorBorderSecondary}`,
+                                borderRadius: 8,
+                                background: token.colorBgElevated,
+                                color: token.colorText,
+                                fontSize: 12,
+                                lineHeight: '14px',
+                                whiteSpace: 'nowrap',
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                                pointerEvents: 'none',
+                                zIndex: 2,
+                              }}
+                              title={agentName ? `${agentName}: ${bubbleText}` : bubbleText}
+                            >
+                              {agentName ? `${agentName}: ` : ''}{bubbleText}
+                            </div>
+                          )}
+
+                          <button
+                            onClick={() => onCellClick(xLocal, yLocal)}
+                            onMouseDown={() => startDrawPOIRect(abs.x, abs.y)}
+                            onMouseEnter={() => updateDrawPOIRect(abs.x, abs.y)}
+                            onMouseUp={() => finishDrawPOIRect(abs.x, abs.y)}
+                            onMouseLeave={() => {
+                              // no-op; keeping draft while leaving cell makes dragging smoother
+                            }}
+                            style={cellStyle(isWall, c, !!agentAt, isTarget, inPath, isInDraftRect(abs.x, abs.y))}
+                            title={agentAt
+                              ? `Agent: ${agentName}${identityText ? `\nIdentity: ${identityText}` : ''}\nActivity: ${activityText}\nPlace: ${placeText}`
+                              : `${isWall ? 'wall' : c || 'empty'} (${abs.x},${abs.y})${poiLabel ? ` | POI: ${poiLabel.full} (${poiLabel.kind})` : ''}`}
+                          >
+                            {label}
+                          </button>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+            )}
+          </Card>
+        </Col>
+
+        <Col xs={24} lg={8}>
+          <Card title="Actions">
+            <Tabs
+              items={[
+                {
+                  key: 'memory',
+                  label: 'Memory',
+                  children: (
+                    <Space direction="vertical" style={{ width: '100%' }} size="middle">
+                      <Select
+                        placeholder="Memory target agent"
+                        options={agentOptions}
+                        value={memAgentId || undefined}
+                        onChange={v => setMemAgentId(v)}
+                        allowClear
+                        style={{ width: '100%' }}
+                      />
+                      <InputNumber min={1} max={10} value={memImportance} onChange={(v) => setMemImportance(Number(v || 1))} style={{ width: '100%' }} />
+                      <Input.TextArea rows={4} value={memText} onChange={e => setMemText(e.target.value)} placeholder="Memory content" />
+                      <Button type="primary" onClick={doInjectMemory} block>Inject Memory</Button>
+                    </Space>
+                  ),
+                },
+                {
+                  key: 'dialogue',
+                  label: 'Dialogue',
+                  children: (
+                    <Space direction="vertical" style={{ width: '100%' }} size="middle">
+                      <Select
+                        placeholder="Initiator"
+                        options={agentOptions}
+                        value={dlgInitiator || undefined}
+                        onChange={v => setDlgInitiator(v)}
+                        allowClear
+                        style={{ width: '100%' }}
+                      />
+                      <Select
+                        placeholder="Partner (optional, auto if empty)"
+                        options={[{ label: '(auto)', value: '' }, ...agentOptions]}
+                        value={dlgPartner}
+                        onChange={v => setDlgPartner(v)}
+                        style={{ width: '100%' }}
+                      />
+                      <InputNumber min={1} max={30} value={dlgMaxTurns} onChange={(v) => setDlgMaxTurns(Number(v || 1))} style={{ width: '100%' }} />
+                      <Input value={dlgEndMarker} onChange={e => setDlgEndMarker(e.target.value)} placeholder="End marker" />
+                      <Input.TextArea rows={4} value={dlgPrompt} onChange={e => setDlgPrompt(e.target.value)} />
+                      <Button type="primary" onClick={doDialogue} loading={creating} block>Run Dialogue Step</Button>
+                      <Input.TextArea rows={8} value={dlgOutput} readOnly placeholder="Dialogue transcript" />
+                    </Space>
+                  ),
+                },
+                {
+                  key: 'path',
+                  label: 'Path',
+                  children: (
+                    <Space direction="vertical" style={{ width: '100%' }} size="middle">
+                      <Select
+                        placeholder="Path agent"
+                        options={agentOptions}
+                        value={selectedAgentId || undefined}
+                        onChange={v => setSelectedAgentId(v)}
+                        allowClear
+                        style={{ width: '100%' }}
+                      />
+                      <Text type="secondary">Set target with Mode = Set Target, then click a cell.</Text>
+                      <Button onClick={() => selectedAgentId && doPlanPath(selectedAgentId)} disabled={!selectedAgentId} block>Plan Path</Button>
+                      <Button type="primary" onClick={() => selectedAgentId && doMoveToTarget(selectedAgentId)} disabled={!selectedAgentId} block>Move To Target</Button>
+                    </Space>
+                  ),
+                },
+                {
+                  key: 'ai',
+                  label: 'AI Paint',
+                  children: (
+                    <Space direction="vertical" style={{ width: '100%' }} size="middle">
+                      <Text type="secondary">AI 会在当前 viewport 内协作绘制（Planner→脚本/宏，Painter→细化）。</Text>
+                      <Input.TextArea rows={4} value={aiPrompt} onChange={(e) => setAiPrompt(e.target.value)} placeholder="Describe what to draw in the current viewport" />
+                      <Segmented
+                        block
+                        options={[
+                          { label: 'Text→Grid', value: 'text' },
+                          { label: 'Text→Image→Grid (AI_4)', value: 'image' },
+                        ]}
+                        value={aiPipeline}
+                        onChange={(v) => setAiPipeline(v as 'text' | 'image')}
+                      />
+                      <Button type="primary" onClick={() => doAIDraw(aiPrompt)} loading={creating} block>
+                        Run AI
+                      </Button>
+                      <Button onClick={doRandomizeRedBlue} loading={creating} block>
+                        Randomize Floor: Blue/Red (Current View)
+                      </Button>
+                    </Space>
+                  ),
+                },
+              ]}
+            />
+          </Card>
+        </Col>
+      </Row>
+    </div>
+  );
+};
+
+export default WorldDesigner;

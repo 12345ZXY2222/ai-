@@ -1,0 +1,1132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI模拟平台 - 完整版</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background-color: #f5f5f5;
+        }
+        
+        .app-container {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #1890ff 0%, #096dd9 100%);
+            color: white;
+            padding: 0 24px;
+            height: 64px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+        }
+        
+        .logo {
+            font-size: 20px;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        
+        .nav-menu {
+            display: flex;
+            gap: 24px;
+            list-style: none;
+        }
+        
+        .nav-menu a {
+            color: white;
+            text-decoration: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            transition: background-color 0.3s;
+        }
+        
+        .nav-menu a:hover {
+            background-color: rgba(255, 255, 255, 0.1);
+        }
+        
+        .nav-menu a.active {
+            background-color: rgba(255, 255, 255, 0.2);
+        }
+        
+        .user-menu {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        
+        .content {
+            flex: 1;
+            padding: 24px;
+            max-width: 1200px;
+            margin: 0 auto;
+            width: 100%;
+        }
+        
+        .card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+            padding: 24px;
+            margin-bottom: 24px;
+        }
+        
+        .card h2 {
+            color: #1890ff;
+            margin-bottom: 16px;
+            border-bottom: 2px solid #f0f0f0;
+            padding-bottom: 8px;
+        }
+        
+        .btn {
+            display: inline-block;
+            padding: 8px 16px;
+            background: #1890ff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            text-decoration: none;
+            transition: background-color 0.3s;
+            font-size: 14px;
+        }
+        
+        .btn:hover {
+            background: #096dd9;
+        }
+        
+        .btn-primary {
+            background: #1890ff;
+        }
+        
+        .btn-success {
+            background: #52c41a;
+        }
+        
+        .btn-warning {
+            background: #faad14;
+        }
+        
+        .btn-danger {
+            background: #ff4d4f;
+        }
+        
+        .btn-secondary {
+            background: #d9d9d9;
+            color: #333;
+        }
+        
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 16px;
+        }
+        
+        .table th,
+        .table td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        
+        .table th {
+            background: #fafafa;
+            font-weight: 600;
+        }
+        
+        .table tr:hover {
+            background: #fafafa;
+        }
+        
+        .tag {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        
+        .tag-success {
+            background: #f6ffed;
+            border: 1px solid #b7eb8f;
+            color: #52c41a;
+        }
+        
+        .tag-warning {
+            background: #fff7e6;
+            border: 1px solid #ffd591;
+            color: #fa8c16;
+        }
+        
+        .tag-error {
+            background: #fff2f0;
+            border: 1px solid #ffccc7;
+            color: #ff4d4f;
+        }
+        
+        .tag-processing {
+            background: #e6f7ff;
+            border: 1px solid #91d5ff;
+            color: #1890ff;
+        }
+        
+        .modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+        
+        .modal-content {
+            background: white;
+            border-radius: 8px;
+            padding: 24px;
+            max-width: 800px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        
+        .form-group {
+            margin-bottom: 16px;
+        }
+        
+        .form-label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+        
+        .form-input {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid #d9d9d9;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        .form-input:focus {
+            outline: none;
+            border-color: #1890ff;
+            box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2);
+        }
+        
+        .api-status {
+            padding: 12px;
+            border-radius: 4px;
+            margin-bottom: 16px;
+        }
+        
+        .api-status-success {
+            background: #f6ffed;
+            border: 1px solid #b7eb8f;
+            color: #52c41a;
+        }
+        
+        .api-status-error {
+            background: #fff2f0;
+            border: 1px solid #ffccc7;
+            color: #ff4d4f;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #999;
+        }
+        
+        .error-message {
+            background: #fff2f0;
+            border: 1px solid #ffccc7;
+            color: #ff4d4f;
+            padding: 16px;
+            border-radius: 4px;
+            margin: 16px 0;
+        }
+        
+        .auth-container {
+            max-width: 400px;
+            margin: 100px auto;
+        }
+        
+        .login-form, .register-form {
+            background: white;
+            padding: 32px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+        
+        .login-form h2, .register-form h2 {
+            text-align: center;
+            margin-bottom: 24px;
+            color: #1890ff;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    
+    <script type="text/babel">
+        // 主应用组件
+        const App = () => {
+            const [currentPage, setCurrentPage] = React.useState('login');
+            const [isAuthenticated, setIsAuthenticated] = React.useState(false);
+            const [token, setToken] = React.useState(localStorage.getItem('token'));
+            const [user, setUser] = React.useState(null);
+            const [apiStatus, setApiStatus] = React.useState('checking');
+            const [apiError, setApiError] = React.useState(null);
+            
+            // 检查token并设置认证状态
+            React.useEffect(() => {
+                if (token) {
+                    checkTokenValidity();
+                } else {
+                    setIsAuthenticated(false);
+                    setCurrentPage('login');
+                }
+            }, [token]);
+            
+            // 检查API连接
+            React.useEffect(() => {
+                if (isAuthenticated) {
+                    checkApiConnection();
+                }
+            }, [isAuthenticated]);
+            
+            const checkTokenValidity = async () => {
+                try {
+                    // 简单检查token是否存在
+                    if (token && token.length > 10) {
+                        setIsAuthenticated(true);
+                        setUser({ username: '管理员' });
+                        setCurrentPage('papers');
+                    } else {
+                        setIsAuthenticated(false);
+                        setCurrentPage('login');
+                    }
+                } catch (error) {
+                    console.error('Token check failed:', error);
+                    setIsAuthenticated(false);
+                    setCurrentPage('login');
+                }
+            };
+            
+            const checkApiConnection = async () => {
+                if (!token) {
+                    setApiStatus('error');
+                    setApiError('未找到认证token');
+                    return;
+                }
+                
+                try {
+                    const response = await fetch('/api/paper-reproductions', {
+                        headers: {
+                            'Authorization': `Bearer ${token}`
+                        }
+                    });
+                    
+                    if (response.ok) {
+                        setApiStatus('connected');
+                    } else if (response.status === 401) {
+                        setApiStatus('unauthorized');
+                        setApiError('Token无效或已过期');
+                    } else {
+                        setApiStatus('error');
+                        setApiError(`API返回状态: ${response.status}`);
+                    }
+                } catch (error) {
+                    setApiStatus('error');
+                    setApiError(error.message);
+                }
+            };
+            
+            const handleLogin = async (username, password) => {
+                try {
+                    const formData = new URLSearchParams();
+                    formData.append('username', username);
+                    formData.append('password', password);
+                    
+                    const response = await fetch('/api/token', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                        },
+                        body: formData
+                    });
+                    
+                    if (response.ok) {
+                        const data = await response.json();
+                        const newToken = data.access_token;
+                        
+                        // 保存token
+                        localStorage.setItem('token', newToken);
+                        setToken(newToken);
+                        setUser({ username });
+                        setIsAuthenticated(true);
+                        setCurrentPage('papers');
+                        
+                        return { success: true };
+                    } else {
+                        const errorText = await response.text();
+                        return { 
+                            success: false, 
+                            error: `登录失败: ${response.status} - ${errorText}` 
+                        };
+                    }
+                } catch (error) {
+                    return { 
+                        success: false, 
+                        error: `网络错误: ${error.message}` 
+                    };
+                }
+            };
+            
+            const handleRegister = async (username, password) => {
+                try {
+                    const response = await fetch('/api/register', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ username, password })
+                    });
+                    
+                    if (response.ok) {
+                        const data = await response.json();
+                        const newToken = data.access_token;
+                        
+                        // 保存token
+                        localStorage.setItem('token', newToken);
+                        setToken(newToken);
+                        setUser({ username });
+                        setIsAuthenticated(true);
+                        setCurrentPage('papers');
+                        
+                        return { success: true };
+                    } else {
+                        const errorText = await response.text();
+                        return { 
+                            success: false, 
+                            error: `注册失败: ${response.status} - ${errorText}` 
+                        };
+                    }
+                } catch (error) {
+                    return { 
+                        success: false, 
+                        error: `网络错误: ${error.message}` 
+                    };
+                }
+            };
+            
+            const handleLogout = () => {
+                localStorage.removeItem('token');
+                setToken(null);
+                setUser(null);
+                setIsAuthenticated(false);
+                setCurrentPage('login');
+            };
+            
+            // 登录页面
+            const LoginPage = () => {
+                const [username, setUsername] = React.useState('');
+                const [password, setPassword] = React.useState('');
+                const [error, setError] = React.useState('');
+                const [loading, setLoading] = React.useState(false);
+                
+                const handleSubmit = async (e) => {
+                    e.preventDefault();
+                    setError('');
+                    setLoading(true);
+                    
+                    const result = await handleLogin(username, password);
+                    
+                    if (result.success) {
+                        // 登录成功，页面会自动跳转
+                    } else {
+                        setError(result.error);
+                        setLoading(false);
+                    }
+                };
+                
+                return (
+                    <div className="auth-container">
+                        <div className="login-form">
+                            <h2>登录 AI模拟平台</h2>
+                            
+                            {error && (
+                                <div className="error-message">
+                                    {error}
+                                </div>
+                            )}
+                            
+                            <form onSubmit={handleSubmit}>
+                                <div className="form-group">
+                                    <label className="form-label">用户名</label>
+                                    <input
+                                        type="text"
+                                        className="form-input"
+                                        value={username}
+                                        onChange={(e) => setUsername(e.target.value)}
+                                        required
+                                        disabled={loading}
+                                    />
+                                </div>
+                                
+                                <div className="form-group">
+                                    <label className="form-label">密码</label>
+                                    <input
+                                        type="password"
+                                        className="form-input"
+                                        value={password}
+                                        onChange={(e) => setPassword(e.target.value)}
+                                        required
+                                        disabled={loading}
+                                    />
+                                </div>
+                                
+                                <div className="form-group">
+                                    <button 
+                                        type="submit" 
+                                        className="btn btn-primary"
+                                        disabled={loading}
+                                        style={{ width: '100%' }}
+                                    >
+                                        {loading ? '登录中...' : '登录'}
+                                    </button>
+                                </div>
+                                
+                                <div style={{ textAlign: 'center', marginTop: '16px' }}>
+                                    <p>还没有账号？ <a href="#" onClick={() => setCurrentPage('register')}>注册</a></p>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                );
+            };
+            
+            // 注册页面
+            const RegisterPage = () => {
+                const [username, setUsername] = React.useState('');
+                const [password, setPassword] = React.useState('');
+                const [confirmPassword, setConfirmPassword] = React.useState('');
+                const [error, setError] = React.useState('');
+                const [loading, setLoading] = React.useState(false);
+                
+                const handleSubmit = async (e) => {
+                    e.preventDefault();
+                    setError('');
+                    
+                    if (password !== confirmPassword) {
+                        setError('两次输入的密码不一致');
+                        return;
+                    }
+                    
+                    if (password.length < 6) {
+                        setError('密码至少需要6个字符');
+                        return;
+                    }
+                    
+                    setLoading(true);
+                    const result = await handleRegister(username, password);
+                    
+                    if (result.success) {
+                        // 注册成功，页面会自动跳转
+                    } else {
+                        setError(result.error);
+                        setLoading(false);
+                    }
+                };
+                
+                return (
+                    <div className="auth-container">
+                        <div className="register-form">
+                            <h2>注册新账号</h2>
+                            
+                            {error && (
+                                <div className="error-message">
+                                    {error}
+                                </div>
+                            )}
+                            
+                            <form onSubmit={handleSubmit}>
+                                <div className="form-group">
+                                    <label className="form-label">用户名</label>
+                                    <input
+                                        type="text"
+                                        className="form-input"
+                                        value={username}
+                                        onChange={(e) => setUsername(e.target.value)}
+                                        required
+                                        disabled={loading}
+                                    />
+                                </div>
+                                
+                                <div className="form-group">
+                                    <label className="form-label">密码</label>
+                                    <input
+                                        type="password"
+                                        className="form-input"
+                                        value={password}
+                                        onChange={(e) => setPassword(e.target.value)}
+                                        required
+                                        disabled={loading}
+                                    />
+                                </div>
+                                
+                                <div className="form-group">
+                                    <label className="form-label">确认密码</label>
+                                    <input
+                                        type="password"
+                                        className="form-input"
+                                        value={confirmPassword}
+                                        onChange={(e) => setConfirmPassword(e.target.value)}
+                                        required
+                                        disabled={loading}
+                                    />
+                                </div>
+                                
+                                <div className="form-group">
+                                    <button 
+                                        type="submit" 
+                                        className="btn btn-primary"
+                                        disabled={loading}
+                                        style={{ width: '100%' }}
+                                    >
+                                        {loading ? '注册中...' : '注册'}
+                                    </button>
+                                </div>
+                                
+                                <div style={{ textAlign: 'center', marginTop: '16px' }}>
+                                    <p>已有账号？ <a href="#" onClick={() => setCurrentPage('login')}>登录</a></p>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                );
+            };
+            
+            // 导航菜单
+            const Navigation = () => (
+                <nav className="header">
+                    <div className="logo">
+                        <span>🤖 AI模拟平台</span>
+                    </div>
+                    
+                    {isAuthenticated && (
+                        <ul className="nav-menu">
+                            <li>
+                                <a 
+                                    href="#" 
+                                    className={currentPage === 'papers' ? 'active' : ''}
+                                    onClick={(e) => { e.preventDefault(); setCurrentPage('papers'); }}
+                                >
+                                    论文复现
+                                </a>
+                            </li>
+                            <li>
+                                <a 
+                                    href="#" 
+                                    className={currentPage === 'agents' ? 'active' : ''}
+                                    onClick={(e) => { e.preventDefault(); setCurrentPage('agents'); }}
+                                >
+                                    智能体管理
+                                </a>
+                            </li>
+                            <li>
+                                <a 
+                                    href="#" 
+                                    className={currentPage === 'relationships' ? 'active' : ''}
+                                    onClick={(e) => { e.preventDefault(); setCurrentPage('relationships'); }}
+                                >
+                                    关系管理
+                                </a>
+                            </li>
+                            <li>
+                                <a 
+                                    href="#" 
+                                    className={currentPage === 'simulation' ? 'active' : ''}
+                                    onClick={(e) => { e.preventDefault(); setCurrentPage('simulation'); }}
+                                >
+                                    模拟设计
+                                </a>
+                            </li>
+                            <li>
+                                <a 
+                                    href="#" 
+                                    className={currentPage === 'world' ? 'active' : ''}
+                                    onClick={(e) => { e.preventDefault(); setCurrentPage('world'); }}
+                                >
+                                    世界设计
+                                </a>
+                            </li>
+                        </ul>
+                    )}
+                    
+                    <div className="user-menu">
+                        {isAuthenticated && user && (
+                            <>
+                                <span>欢迎, {user.username}</span>
+                                <button className="btn btn-secondary" onClick={handleLogout}>
+                                    退出
+                                </button>
+                            </>
+                        )}
+                    </div>
+                </nav>
+            );
+            
+            // API状态显示
+            const ApiStatus = () => {
+                if (!isAuthenticated || currentPage === 'login' || currentPage === 'register') {
+                    return null;
+                }
+                
+                if (apiStatus === 'checking') {
+                    return <div className="api-status">检查API连接中...</div>;
+                }
+                
+                if (apiStatus === 'connected') {
+                    return (
+                        <div className="api-status api-status-success">
+                            ✅ 后端API连接正常 (localhost:8001)
+                        </div>
+                    );
+                }
+                
+                if (apiStatus === 'unauthorized') {
+                    return (
+                        <div className="api-status api-status-error">
+                            ❌ 认证失效，请重新登录
+                            <button className="btn" onClick={handleLogout} style={{ marginLeft: '8px' }}>
+                                重新登录
+                            </button>
+                        </div>
+                    );
+                }
+                
+                if (apiStatus === 'error') {
+                    return (
+                        <div className="api-status api-status-error">
+                            ❌ API连接失败: {apiError}
+                            <div style={{ marginTop: '8px', fontSize: '14px' }}>
+                                <button className="btn" onClick={checkApiConnection} style={{ marginRight: '8px' }}>
+                                    重试连接
+                                </button>
+                                <button className="btn btn-secondary" onClick={handleLogout}>
+                                    重新登录
+                                </button>
+                            </div>
+                        </div>
+                    );
+                }
+                
+                return null;
+            };
+            
+            // 论文复现页面
+            const PapersPage = () => {
+                const [papers, setPapers] = React.useState([]);
+                const [loading, setLoading] = React.useState(true);
+                const [selectedPaper, setSelectedPaper] = React.useState(null);
+                const [showModal, setShowModal] = React.useState(false);
+                const [uploading, setUploading] = React.useState(false);
+                
+                React.useEffect(() => {
+                    fetchPapers();
+                }, []);
+                
+                const fetchPapers = async () => {
+                    if (!token) {
+                        setLoading(false);
+                        return;
+                    }
+                    
+                    try {
+                        const response = await fetch('/api/paper-reproductions', {
+                            headers: {
+                                'Authorization': `Bearer ${token}`
+                            }
+                        });
+                        
+                        if (response.ok) {
+                            const data = await response.json();
+                            setPapers(data);
+                        } else {
+                            console.error('Failed to fetch papers:', response.status);
+                        }
+                    } catch (error) {
+                        console.error('Error fetching papers:', error);
+                    } finally {
+                        setLoading(false);
+                    }
+                };
+                
+                const formatFileSize = (bytes) => {
+                    if (!bytes) return '0 B';
+                    if (bytes < 1024) return bytes + ' B';
+                    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+                    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+                };
+                
+                const formatDate = (dateString) => {
+                    if (!dateString) return '未知时间';
+                    return new Date(dateString).toLocaleString('zh-CN');
+                };
+                
+                const getStatusTag = (status) => {
+                    if (!status) return <span className="tag">未知</span>;
+                    
+                    switch (status.toLowerCase()) {
+                        case 'completed':
+                            return <span className="tag tag-success">已完成</span>;
+                        case 'analyzing':
+                        case 'processing':
+                            return <span className="tag tag-warning">分析中</span>;
+                        case 'failed':
+                        case 'error':
+                            return <span className="tag tag-error">失败</span>;
+                        default:
+                            return <span className="tag tag-processing">处理中</span>;
+                    }
+                };
+                
+                const handleViewDetails = (paper) => {
+                    setSelectedPaper(paper);
+                    setShowModal(true);
+                };
+                
+                const handleUploadPaper = () => {
+                    alert('论文上传功能需要文件选择器。当前为演示模式，可以集成真实的上传功能。');
+                };
+                
+                const handleAnalyzePaper = async (paperId) => {
+                    if (!token) return;
+                    
+                    try {
+                        const response = await fetch(`/api/paper-reproductions/${paperId}/analyze`, {
+                            method: 'POST',
+                            headers: {
+                                'Authorization': `Bearer ${token}`
+                            }
+                        });
+                        
+                        if (response.ok) {
+                            alert('开始分析论文...');
+                            fetchPapers(); // 刷新列表
+                        } else {
+                            alert('分析失败');
+                        }
+                    } catch (error) {
+                        alert('分析失败: ' + error.message);
+                    }
+                };
+                
+                const handleExecuteCode = async (paperId) => {
+                    if (!token) return;
+                    
+                    try {
+                        const response = await fetch(`/api/paper-reproductions/${paperId}/execute`, {
+                            method: 'POST',
+                            headers: {
+                                'Authorization': `Bearer ${token}`
+                            }
+                        });
+                        
+                        if (response.ok) {
+                            alert('开始执行复现代码...');
+                            fetchPapers(); // 刷新列表
+                        } else {
+                            alert('执行失败');
+                        }
+                    } catch (error) {
+                        alert('执行失败: ' + error.message);
+                    }
+                };
+                
+                if (loading) {
+                    return (
+                        <div className="card">
+                            <div className="loading">
+                                <p>加载论文列表中...</p>
+                            </div>
+                        </div>
+                    );
+                }
+                
+                return (
+                    <div>
+                        <div className="card">
+                            <h2>论文复现管理</h2>
+                            <p>上传、分析和执行论文复现代码。</p>
+                            
+                            <div style={{ margin: '16px 0' }}>
+                                <button className="btn btn-primary" onClick={handleUploadPaper}>
+                                    上传论文PDF
+                                </button>
+                                <button className="btn" onClick={fetchPapers} style={{ marginLeft: '8px' }}>
+                                    刷新列表
+                                </button>
+                                <span style={{ marginLeft: '12px', color: '#666', fontSize: '14px' }}>
+                                    共 {papers.length} 篇论文
+                                </span>
+                            </div>
+                            
+                            <div className="card">
+                                <h3>论文列表</h3>
+                                {papers.length === 0 ? (
+                                    <div style={{ textAlign: 'center', padding: '40px', color: '#999' }}>
+                                        <p>暂无论文数据</p>
+                                        <p>请上传论文PDF文件开始使用</p>
+                                    </div>
+                                ) : (
+                                    <table className="table">
+                                        <thead>
+                                            <tr>
+                                                <th>标题</th>
+                                                <th>状态</th>
+                                                <th>文件大小</th>
+                                                <th>上传时间</th>
+                                                <th>操作</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {papers.map(paper => (
+                                                <tr key={paper.id}>
+                                                    <td>
+                                                        <div style={{ fontWeight: '500' }}>{paper.title || '未命名论文'}</div>
+                                                        <div style={{ fontSize: '12px', color: '#666' }}>
+                                                            ID: {paper.id?.substring(0, 8) || 'N/A'}...
+                                                        </div>
+                                                    </td>
+                                                    <td>{getStatusTag(paper.status)}</td>
+                                                    <td>{formatFileSize(paper.file_size)}</td>
+                                                    <td>{formatDate(paper.created_at)}</td>
+                                                    <td>
+                                                        <div style={{ display: 'flex', gap: '8px' }}>
+                                                            <button 
+                                                                className="btn"
+                                                                onClick={() => handleViewDetails(paper)}
+                                                            >
+                                                                查看
+                                                            </button>
+                                                            <button 
+                                                                className="btn btn-success"
+                                                                onClick={() => handleAnalyzePaper(paper.id)}
+                                                            >
+                                                                分析
+                                                            </button>
+                                                            <button 
+                                                                className="btn btn-warning"
+                                                                onClick={() => handleExecuteCode(paper.id)}
+                                                            >
+                                                                执行
+                                                            </button>
+                                                        </div>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                )}
+                            </div>
+                        </div>
+                        
+                        {showModal && selectedPaper && (
+                            <div className="modal">
+                                <div className="modal-content">
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                                        <h3>论文详情</h3>
+                                        <button className="btn" onClick={() => setShowModal(false)}>
+                                            关闭
+                                        </button>
+                                    </div>
+                                    
+                                    <h4>{selectedPaper.title || '未命名论文'}</h4>
+                                    
+                                    <div style={{ margin: '16px 0', padding: '16px', background: '#fafafa', borderRadius: '4px' }}>
+                                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+                                            <div>
+                                                <strong>论文ID:</strong> {selectedPaper.id || 'N/A'}
+                                            </div>
+                                            <div>
+                                                <strong>状态:</strong> {getStatusTag(selectedPaper.status)}
+                                            </div>
+                                            <div>
+                                                <strong>文件大小:</strong> {formatFileSize(selectedPaper.file_size)}
+                                            </div>
+                                            <div>
+                                                <strong>上传时间:</strong> {formatDate(selectedPaper.created_at)}
+                                            </div>
+                                        </div>
+                                    </div>
+                                    
+                                    {selectedPaper.description && (
+                                        <div style={{ margin: '16px 0' }}>
+                                            <strong>描述:</strong>
+                                            <p>{selectedPaper.description}</p>
+                                        </div>
+                                    )}
+                                    
+                                    {selectedPaper.reproduction_code && (
+                                        <div style={{ margin: '16px 0' }}>
+                                            <strong>复现代码:</strong>
+                                            <pre style={{
+                                                background: '#f6f8fa',
+                                                padding: '12px',
+                                                borderRadius: '4px',
+                                                overflow: 'auto',
+                                                fontSize: '12px',
+                                                marginTop: '8px',
+                                                maxHeight: '200px'
+                                            }}>
+                                                {selectedPaper.reproduction_code}
+                                            </pre>
+                                        </div>
+                                    )}
+                                    
+                                    {selectedPaper.execution_result && (
+                                        <div style={{ margin: '16px 0' }}>
+                                            <strong>执行结果:</strong>
+                                            <pre style={{
+                                                background: '#f6f8fa',
+                                                padding: '12px',
+                                                borderRadius: '4px',
+                                                overflow: 'auto',
+                                                fontSize: '12px',
+                                                marginTop: '8px',
+                                                maxHeight: '200px'
+                                            }}>
+                                                {selectedPaper.execution_result}
+                                            </pre>
+                                        </div>
+                                    )}
+                                    
+                                    {selectedPaper.error_message && (
+                                        <div style={{ margin: '16px 0' }}>
+                                            <strong>错误信息:</strong>
+                                            <div className="error-message">
+                                                {selectedPaper.error_message}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                );
+            };
+            
+            // 其他页面组件
+            const AgentsPage = () => (
+                <div className="card">
+                    <h2>智能体管理</h2>
+                    <p>创建、配置和管理AI智能体。</p>
+                    <div className="card">
+                        <h3>智能体列表</h3>
+                        <p>智能体管理功能需要完整的React应用支持。</p>
+                        <p>当前为CDN版本，完整功能需要修复Vite模块系统后迁移。</p>
+                    </div>
+                </div>
+            );
+            
+            const RelationshipsPage = () => (
+                <div className="card">
+                    <h2>关系管理</h2>
+                    <p>管理智能体之间的关系和交互。</p>
+                    <div className="card">
+                        <h3>关系网络</h3>
+                        <p>关系管理功能需要完整的React应用支持。</p>
+                    </div>
+                </div>
+            );
+            
+            const SimulationPage = () => (
+                <div className="card">
+                    <h2>模拟设计</h2>
+                    <p>设计和配置AI模拟场景。</p>
+                    <div className="card">
+                        <h3>模拟编辑器</h3>
+                        <p>模拟设计功能需要完整的React应用支持。</p>
+                    </div>
+                </div>
+            );
+            
+            const WorldPage = () => (
+                <div className="card">
+                    <h2>世界设计</h2>
+                    <p>设计和配置模拟世界环境。</p>
+                    <div className="card">
+                        <h3>世界编辑器</h3>
+                        <p>世界设计功能需要完整的React应用支持。</p>
+                    </div>
+                </div>
+            );
+            
+            // 主渲染逻辑
+            if (!isAuthenticated) {
+                if (currentPage === 'register') {
+                    return <RegisterPage />;
+                }
+                return <LoginPage />;
+            }
+            
+            const renderContent = () => {
+                switch (currentPage) {
+                    case 'agents':
+                        return <AgentsPage />;
+                    case 'relationships':
+                        return <RelationshipsPage />;
+                    case 'simulation':
+                        return <SimulationPage />;
+                    case 'world':
+                        return <WorldPage />;
+                    case 'papers':
+                    default:
+                        return <PapersPage />;
+                }
+            };
+            
+            return (
+                <div className="app-container">
+                    <Navigation />
+                    <main className="content">
+                        <ApiStatus />
+                        {renderContent()}
+                    </main>
+                </div>
+            );
+        };
+        
+        // 渲染应用
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(React.createElement(App));
+        
+        console.log('AI模拟平台 - 完整CDN版本已加载');
+    </script>
+</body>
+</html>

@@ -1,0 +1,112 @@
+import React from 'react';
+import { BrowserRouter as Router, Routes, Route, Link, Navigate, useLocation } from 'react-router-dom';
+import { Layout, Menu, Button, Alert } from 'antd';
+import { AuthProvider } from './context/AuthContext';
+import { SimulationProvider } from './context/SimulationContext';
+
+const { Header, Content, Footer } = Layout;
+
+// Simple test component
+const TestPage: React.FC<{ name: string }> = ({ name }) => {
+  return (
+    <div style={{ padding: '20px' }}>
+      <h2>{name}</h2>
+      <p>This is a test page to verify the platform is working.</p>
+      <div style={{ marginTop: '20px', padding: '15px', backgroundColor: '#e8f5e9' }}>
+        <p>✅ Component loaded successfully</p>
+      </div>
+    </div>
+  );
+};
+
+const AppLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+    const location = useLocation();
+    
+    const getSelectedKey = () => {
+        if (location.pathname === '/') return ['1'];
+        if (location.pathname.startsWith('/agent')) return ['1'];
+        if (location.pathname === '/relationships') return ['2'];
+        if (location.pathname === '/simulation') return ['3'];
+        if (location.pathname === '/world') return ['4'];
+        if (location.pathname === '/papers') return ['5'];
+        return ['1'];
+    };
+
+    const menuItems = [
+        { key: '1', label: <Link to="/">Agents</Link> },
+        { key: '2', label: <Link to="/relationships">Relationships</Link> },
+        { key: '3', label: <Link to="/simulation">Simulation</Link> },
+        { key: '4', label: <Link to="/world">World</Link> },
+        { key: '5', label: <Link to="/papers">Papers</Link> },
+    ];
+
+    return (
+        <Layout style={{ minHeight: '100vh' }}>
+            <Header style={{ display: 'flex', alignItems: 'center' }}>
+                <div style={{ 
+                    color: 'white', 
+                    fontSize: '18px', 
+                    fontWeight: 'bold', 
+                    marginRight: '24px',
+                    minWidth: '200px'
+                }}>
+                    AI Simulation Platform
+                </div>
+                <Menu
+                    theme="dark"
+                    mode="horizontal"
+                    selectedKeys={getSelectedKey()}
+                    items={menuItems}
+                    style={{ flex: 1 }}
+                />
+                <div>
+                    <Link to="/login">
+                        <Button type="link" style={{ color: 'white', marginRight: '8px' }}>
+                            Login
+                        </Button>
+                    </Link>
+                </div>
+            </Header>
+            
+            <Content style={{ padding: '0 50px', marginTop: '16px' }}>
+                <div style={{ 
+                    background: 'white', 
+                    padding: '24px', 
+                    minHeight: 'calc(100vh - 134px)',
+                    borderRadius: '8px'
+                }}>
+                    {children}
+                </div>
+            </Content>
+            
+            <Footer style={{ textAlign: 'center' }}>
+                AI Simulation Platform ©{new Date().getFullYear()}
+            </Footer>
+        </Layout>
+    );
+};
+
+const App: React.FC = () => {
+    return (
+        <Router>
+            <AuthProvider>
+                <SimulationProvider>
+                    <AppLayout>
+                        <Routes>
+                            <Route path="/" element={<TestPage name="Home" />} />
+                            <Route path="/login" element={<TestPage name="Login" />} />
+                            <Route path="/register" element={<TestPage name="Register" />} />
+                            <Route path="/papers" element={<TestPage name="Papers" />} />
+                            <Route path="/relationships" element={<TestPage name="Relationships" />} />
+                            <Route path="/simulation" element={<TestPage name="Simulation" />} />
+                            <Route path="/world" element={<TestPage name="World" />} />
+                            <Route path="*" element={<Navigate to="/" replace />} />
+                        </Routes>
+                    </AppLayout>
+                </SimulationProvider>
+            </AuthProvider>
+        </Router>
+    );
+};
+
+export default App;

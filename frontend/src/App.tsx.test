@@ -1,0 +1,16 @@
+import React from 'react';
+
+const App: React.FC = () => {
+  return (
+    <div style={{ padding: '20px', textAlign: 'center' }}>
+      <h1>AI Simulation Platform Test</h1>
+      <p>If you can see this, React is working correctly.</p>
+      <div style={{ marginTop: '20px', padding: '10px', backgroundColor: '#f0f0f0' }}>
+        <p>Frontend is loading successfully.</p>
+        <p>Check the browser console for any errors.</p>
+      </div>
+    </div>
+  );
+};
+
+export default App;

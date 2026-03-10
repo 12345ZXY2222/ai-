@@ -1,0 +1,77 @@
+import React from 'react';
+import { BrowserRouter as Router, Routes, Route, Link } from 'react-router-dom';
+import { Layout, Menu, Typography } from 'antd';
+
+const { Header, Content, Footer } = Layout;
+const { Title } = Typography;
+
+// Simplified App without authentication
+const App: React.FC = () => {
+  return (
+    <Router>
+      <Layout style={{ minHeight: '100vh' }}>
+        <Header style={{ display: 'flex', alignItems: 'center' }}>
+          <div style={{ color: 'white', fontSize: '18px', fontWeight: 'bold', marginRight: '24px' }}>
+            AI Simulation Platform
+          </div>
+          <Menu
+            theme="dark"
+            mode="horizontal"
+            defaultSelectedKeys={['1']}
+            items={[
+              { key: '1', label: <Link to="/">Home</Link> },
+              { key: '2', label: <Link to="/papers">Papers</Link> },
+            ]}
+          />
+        </Header>
+        
+        <Content style={{ padding: '20px 50px' }}>
+          <Routes>
+            <Route path="/" element={
+              <div style={{ textAlign: 'center', padding: '40px' }}>
+                <Title level={2}>Welcome to AI Simulation Platform</Title>
+                <p>This is a simplified version to test basic functionality.</p>
+                <p>If you can see this page, React and routing are working correctly.</p>
+                <div style={{ 
+                  marginTop: '30px', 
+                  padding: '20px', 
+                  backgroundColor: '#f0f0f0',
+                  borderRadius: '8px'
+                }}>
+                  <h3>Test Links:</h3>
+                  <p><Link to="/papers">Go to Papers Page</Link></p>
+                  <p><a href="http://localhost:8001/docs" target="_blank" rel="noopener noreferrer">
+                    Open API Documentation
+                  </a></p>
+                </div>
+              </div>
+            } />
+            
+            <Route path="/papers" element={
+              <div style={{ padding: '20px' }}>
+                <Title level={3}>Papers Page</Title>
+                <p>This would normally show the paper reproduction interface.</p>
+                <p>For now, this is a simplified placeholder.</p>
+                <div style={{ 
+                  marginTop: '20px', 
+                  padding: '20px', 
+                  border: '2px dashed #1890ff',
+                  borderRadius: '8px'
+                }}>
+                  <p><strong>Status:</strong> Basic routing is working</p>
+                  <p><strong>Next:</strong> If this page loads, the main app components can be gradually restored.</p>
+                </div>
+              </div>
+            } />
+          </Routes>
+        </Content>
+        
+        <Footer style={{ textAlign: 'center' }}>
+          AI Simulation Platform ©{new Date().getFullYear()} - Simplified Test Version
+        </Footer>
+      </Layout>
+    </Router>
+  );
+};
+
+export default App;

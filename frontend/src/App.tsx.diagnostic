@@ -1,0 +1,64 @@
+import React from 'react';
+
+const App: React.FC = () => {
+  return (
+    <div style={{ 
+      padding: '40px', 
+      fontFamily: 'Arial, sans-serif',
+      textAlign: 'center' 
+    }}>
+      <h1 style={{ color: '#1890ff' }}>✅ AI Simulation Platform - Diagnostic Test</h1>
+      <p>If you can see this message, React is working correctly.</p>
+      <div style={{ 
+        marginTop: '20px', 
+        padding: '20px', 
+        backgroundColor: '#f0f0f0',
+        borderRadius: '8px',
+        display: 'inline-block'
+      }}>
+        <h3>System Status Check:</h3>
+        <ul style={{ textAlign: 'left', display: 'inline-block' }}>
+          <li>✅ React loaded successfully</li>
+          <li>✅ Basic rendering working</li>
+          <li>✅ CSS styling applied</li>
+          <li>✅ JavaScript execution confirmed</li>
+        </ul>
+        <button 
+          onClick={() => {
+            const result = document.getElementById('test-result');
+            if (result) {
+              result.textContent = '✅ JavaScript click handler working! ' + new Date().toLocaleTimeString();
+            }
+          }}
+          style={{ 
+            padding: '10px 20px', 
+            backgroundColor: '#1890ff', 
+            color: 'white', 
+            border: 'none', 
+            borderRadius: '4px',
+            marginTop: '10px',
+            cursor: 'pointer'
+          }}
+        >
+          Test JavaScript Click
+        </button>
+        <div id="test-result" style={{ marginTop: '10px', fontWeight: 'bold' }}></div>
+      </div>
+      <div style={{ marginTop: '30px' }}>
+        <h3>Service Links:</h3>
+        <p>
+          <a href="http://localhost:8001/docs" target="_blank" rel="noopener noreferrer" style={{ color: '#1890ff' }}>
+            Open API Documentation (Swagger UI)
+          </a>
+        </p>
+        <p>
+          <a href="http://localhost:8001/" target="_blank" rel="noopener noreferrer" style={{ color: '#1890ff' }}>
+            Check Backend API Status
+          </a>
+        </p>
+      </div>
+    </div>
+  );
+};
+
+export default App;

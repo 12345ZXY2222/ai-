@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>React CDN Test</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; }
+        .success { color: green; font-weight: bold; }
+        .error { color: red; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>React CDN Direct Test</h1>
+    <div id="root"></div>
+    
+    <script type="text/babel">
+        console.log('CDN React test starting...');
+        
+        // 检查全局React变量
+        console.log('React global:', window.React);
+        console.log('ReactDOM global:', window.ReactDOM);
+        
+        if (!window.React || !window.ReactDOM) {
+            document.getElementById('root').innerHTML = 
+                '<p class="error">❌ React or ReactDOM not loaded from CDN</p>';
+            throw new Error('React CDN not loaded');
+        }
+        
+        const { createRoot } = ReactDOM;
+        
+        function TestApp() {
+            return React.createElement('div', null, 
+                React.createElement('h1', null, 'CDN React Working!'),
+                React.createElement('p', null, 'If you see this, React works via CDN.'),
+                React.createElement('div', { style: { backgroundColor: '#e8f5e9', padding: '15px' } },
+                    React.createElement('p', { className: 'success' }, '✅ React CDN test successful')
+                )
+            );
+        }
+        
+        const rootElement = document.getElementById('root');
+        if (rootElement) {
+            const root = createRoot(rootElement);
+            root.render(React.createElement(TestApp));
+            console.log('React CDN render successful');
+        } else {
+            console.error('Root element not found');
+        }
+        
+        console.log('CDN React test finished');
+    </script>
+</body>
+</html>

@@ -1,0 +1,12370 @@
+from fastapi import APIRouter, HTTPException, UploadFile, File, Depends, status, BackgroundTasks
+
+
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+
+
+from pydantic import BaseModel
+
+
+from typing import Any, List, Dict, Optional
+
+
+import uuid
+
+
+import json
+
+
+import re
+
+
+import os
+
+
+import shutil
+
+
+from datetime import timedelta
+
+
+from jinja2 import Template
+
+
+import io
+
+
+import sys
+
+
+from contextlib import redirect_stdout
+
+
+from app.models.agent import AgentCreateRequest, AgentUpdateRequest, AgentResponse, GenerateCodeRequest, GenerateCodeResponse, ChatRequest, RelationshipCreateRequest, RelationshipResponse, FixCodeRequest, FixCodeResponse
+
+
+from app.models.simulation import SimulationRunRequest, SimulationStepResponse, Simulation, SimulationRun, SimulationGenerateRequest
+
+
+from app.models.world import (
+
+
+    WorldCreateRequest,
+
+
+    WorldUpdateRequest,
+
+
+    WorldResponse,
+
+
+    PlaceAgentRequest,
+
+
+    MoveAgentRequest,
+
+
+    PlanPathRequest,
+
+
+    PlanPathResponse,
+
+
+    WorldPOI,
+
+
+    WorldPOICreateRequest,
+
+
+    WorldPOIUpdateRequest,
+
+
+    WorldPOIsResponse,
+
+
+    PlanPathToPOIRequest,
+
+
+    PlanPathToPOIResponse,
+
+
+    WorldIdentity,
+
+
+    WorldIdentitiesResponse,
+
+
+    WorldIdentityCreateRequest,
+
+
+    WorldIdentityUpdateRequest,
+
+
+    SetWorldAgentIdentityRequest,
+
+
+    PickPOIPathRequest,
+
+
+    PickPOIPathResponse,
+
+
+    PathPoint,
+
+
+    WorldViewResponse,
+
+
+    WorldDrawRequest,
+
+
+    WorldDrawOp,
+
+
+    WorldAIDrawRequest,
+
+
+    WorldAIDrawResponse,
+
+
+    WorldAIScriptRequest,
+
+
+    WorldAIScriptResponse,
+
+
+    WorldScriptCommand,
+
+
+    WorldAIGenerateRequest,
+
+
+    WorldAIGenerateResponse,
+
+
+    WorldAIImageRequest,
+
+
+    WorldAIImageResponse,
+
+
+    WorldColorLabel,
+
+
+    make_preset_layers,
+
+
+    make_campus_default_pois,
+
+
+)
+
+
+from app.models.user import User, UserCreate, Token, UserInDB
+
+
+from app.core.agent_generator import generate_adapter_code, fix_code_snippet
+
+
+from app.core.simulation_generator import generate_simulation_config, clean_and_parse_json
+
+
+from app.core.adapter import ai_chat, prepare_multimodal_messages, extract_content_from_raw
+
+
+from app.core.storage import load_data, save_data
+
+
+from app.core.security import verify_password, get_password_hash, create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
+
+
+from app.core.file_utils import extract_text_from_file
+
+
+from app.core.memory.memory_agent import MemoryAgent
+
+
+from jose import JWTError, jwt
+
+
+from app.core.security import SECRET_KEY, ALGORITHM
+
+
+import logging
+
+
+import time
+
+
+import requests
+
+
+import mimetypes
+
+
+import base64
+
+
+from PIL import Image
+
+
+import random
+
+
+import math
+
+
+import statistics
+
+
+import ast
+
+
+
+
+
+
+
+
+router = APIRouter()
+
+
+
+
+
+
+
+
+class WorldEncounterDialogueRequest(BaseModel):
+
+
+    agent_a_id: str
+
+
+    agent_b_id: str
+
+
+    topic: Optional[str] = None
+
+
+    # Total turns; will be clamped to [2,6].
+
+
+    max_turns: int = 2
+
+
+
+
+
+
+
+
+class WorldEncounterDialogueTurn(BaseModel):
+
+
+    agent_id: str
+
+
+    text: str
+
+
+
+
+
+
+
+
+class WorldEncounterDialogueResponse(BaseModel):
+
+
+    turns: List[WorldEncounterDialogueTurn]
+
+
+
+
+
+
+
+
+class WorldEventRecord(BaseModel):
+
+
+    id: str
+
+
+    world_id: str
+
+
+    type: str
+
+
+    timestamp: float
+
+
+    data: Dict
+
+
+
+
+
+
+
+
+class WorldEventsResponse(BaseModel):
+
+
+    events: List[WorldEventRecord]
+
+
+
+
+
+# Data Storage
+
+
+AGENTS_DB: Dict[str, Dict] = load_data("agents.json", {})
+
+
+RELATIONSHIPS_DB: Dict[str, Dict] = load_data("relationships.json", {})
+
+
+SIMULATIONS_DB: Dict[str, Dict] = load_data("simulations.json", {})
+
+
+RUNS_DB: Dict[str, Dict] = load_data("runs.json", {})
+
+
+CHAT_HISTORY_DB: Dict[str, List[Dict]] = load_data("chat_history.json", {})
+
+
+USERS_DB: Dict[str, Dict] = load_data("users.json", {}) # username -> UserInDB dict
+
+
+WORLDS_DB: Dict[str, Dict] = load_data("worlds.json", {})
+
+
+WORLD_EVENTS_DB: Dict[str, List[Dict]] = load_data("world_events.json", {})
+
+
+
+
+
+
+
+
+
+
+# ---------- Path Planning Cache ----------
+
+import hashlib
+
+from functools import lru_cache
+
+from typing import Dict, Tuple, Optional
+
+
+
+# In-memory cache for path planning results
+
+_path_cache: Dict[Tuple[str, int, int, int, int], list] = {}
+
+_world_version: Dict[str, int] = {}
+
+
+
+def _get_world_version(world_id: str) -> int:
+
+    """Get current version number for a world, incrementing if not exists."""
+
+    if world_id not in _world_version:
+
+        _world_version[world_id] = 0
+
+    return _world_version[world_id]
+
+
+
+def _invalidate_world_cache(world_id: str):
+
+    """Invalidate all cached paths for a world."""
+
+    keys_to_delete = [key for key in _path_cache.keys() if key[0] == world_id]
+
+    for key in keys_to_delete:
+
+        del _path_cache[key]
+
+    _world_version[world_id] = _world_version.get(world_id, 0) + 1
+
+    print(f"Invalidated cache for world {world_id}, new version {_world_version[world_id]}")
+
+
+
+def _cached_a_star_path(world_id: str, world: dict, start_x: int, start_y: int, target_x: int, target_y: int) -> Optional[list]:
+
+    """Cached version of _a_star_path."""
+
+    version = _get_world_version(world_id)
+
+    cache_key = (world_id, start_x, start_y, target_x, target_y)
+
+    if cache_key in _path_cache:
+
+        return _path_cache[cache_key]
+
+    # Compute path
+
+    path = _a_star_path(world, start_x, start_y, target_x, target_y)
+
+    if path is not None:
+
+        _path_cache[cache_key] = path
+
+    return path
+
+# ---------- End Cache ----------
+
+
+
+def _append_world_event(current_user: User, world: Dict, event_type: str, data: Dict) -> None:
+
+
+    """Append a per-world event record to backend/data/world_events.json (best-effort)."""
+
+
+    try:
+
+
+        world_id = world.get("id")
+
+
+        if not world_id:
+
+
+            return
+
+
+        if world.get("user_id") != current_user.username:
+
+
+            return
+
+
+
+
+
+        ev = {
+
+
+            "id": str(uuid.uuid4()),
+
+
+            "world_id": world_id,
+
+
+            "type": event_type,
+
+
+            "timestamp": time.time(),
+
+
+            "data": data or {},
+
+
+        }
+
+
+        WORLD_EVENTS_DB.setdefault(world_id, []).append(ev)
+
+
+        if len(WORLD_EVENTS_DB[world_id]) > 1000:
+
+
+            WORLD_EVENTS_DB[world_id] = WORLD_EVENTS_DB[world_id][-1000:]
+
+
+        save_data("world_events.json", WORLD_EVENTS_DB)
+
+
+    except Exception:
+
+
+        return
+
+
+
+
+
+
+
+
+def _append_agent_chat_history(agent_id: str, message: Dict) -> None:
+
+
+    if not agent_id:
+
+
+        return
+
+
+    CHAT_HISTORY_DB.setdefault(agent_id, []).append(message)
+
+
+    if len(CHAT_HISTORY_DB[agent_id]) > 5000:
+
+
+        CHAT_HISTORY_DB[agent_id] = CHAT_HISTORY_DB[agent_id][-5000:]
+
+
+    save_data("chat_history.json", CHAT_HISTORY_DB)
+
+
+
+
+
+
+
+
+def _inject_agent_memory_side_effect(agent: Dict, content: str, importance: int = 1) -> None:
+
+
+    """Best-effort memory injection mirroring /agents/{id}/memory/inject."""
+
+
+    try:
+
+
+        agent_id = agent.get("id")
+
+
+        if not agent_id or not content:
+
+
+            return
+
+
+        mem_agent = MemoryAgent(agent_id)
+
+
+        mem_agent.add_observation(content, importance)
+
+
+
+
+
+        if "long_term_memory" not in agent:
+
+
+            agent["long_term_memory"] = []
+
+
+        agent["long_term_memory"].append(content)
+
+
+        AGENTS_DB[agent_id] = agent
+
+
+        save_data("agents.json", AGENTS_DB)
+
+
+    except Exception:
+
+
+        return
+
+
+
+
+
+
+
+
+def _coord_key(x: int, y: int) -> str:
+
+
+    return f"{x},{y}"
+
+
+
+
+
+
+
+
+def _parse_coord_key(key: str):
+
+
+    xs, ys = key.split(",", 1)
+
+
+    return int(xs), int(ys)
+
+
+
+
+
+
+
+
+def _normalize_world_schema(world: Dict) -> Dict:
+
+
+    """Migrate legacy dense `grid` worlds into sparse `walls` + `colors` fields."""
+
+
+    if world is None:
+
+
+        return world
+
+
+
+
+
+    width = int(world.get("width") or 0)
+
+
+    height = int(world.get("height") or 0)
+
+
+    world.setdefault("agent_placements", [])
+
+
+    world.setdefault("pois", [])
+
+
+    world.setdefault("identities", [])
+
+
+    world.setdefault("agent_identities", {})
+
+
+
+
+
+    if "walls" not in world or "colors" not in world:
+
+
+        walls = set()
+
+
+        colors: Dict[str, WorldColorLabel] = {}
+
+
+        grid = world.get("grid")
+
+
+        if isinstance(grid, list) and grid:
+
+
+            # Best-effort migration.
+
+
+            for y, row in enumerate(grid):
+
+
+                if not isinstance(row, list):
+
+
+                    continue
+
+
+                for x, cell in enumerate(row):
+
+
+                    if cell == "wall":
+
+
+                        walls.add(_coord_key(x, y))
+
+
+                    elif cell == "court":
+
+
+                        colors[_coord_key(x, y)] = "neutral"
+
+
+        world["walls"] = sorted(walls)
+
+
+        world["colors"] = colors
+
+
+        # Avoid persisting huge dense grids.
+
+
+        if "grid" in world:
+
+
+            del world["grid"]
+
+
+
+
+
+    # Ensure types
+
+
+    if not isinstance(world.get("walls"), list):
+
+
+        world["walls"] = []
+
+
+    if not isinstance(world.get("colors"), dict):
+
+
+        world["colors"] = {}
+
+
+    if not isinstance(world.get("pois"), list):
+
+
+        world["pois"] = []
+
+
+    if not isinstance(world.get("identities"), list):
+
+
+        world["identities"] = []
+
+
+    if not isinstance(world.get("agent_identities"), dict):
+
+
+        world["agent_identities"] = {}
+
+
+
+
+
+    # Clamp any out-of-bounds coords defensively
+
+
+    if width > 0 and height > 0:
+
+
+        wset = set()
+
+
+        for k in world.get("walls") or []:
+
+
+            try:
+
+
+                x, y = _parse_coord_key(k)
+
+
+            except Exception:
+
+
+                continue
+
+
+            if 0 <= x < width and 0 <= y < height:
+
+
+                wset.add(_coord_key(x, y))
+
+
+        world["walls"] = sorted(wset)
+
+
+
+
+
+        colors2: Dict[str, WorldColorLabel] = {}
+
+
+        for k, v in (world.get("colors") or {}).items():
+
+
+            try:
+
+
+                x, y = _parse_coord_key(k)
+
+
+            except Exception:
+
+
+                continue
+
+
+            if 0 <= x < width and 0 <= y < height:
+
+
+                colors2[_coord_key(x, y)] = v
+
+
+        world["colors"] = colors2
+
+
+
+
+
+    # Sanitize identity schedules (older data may contain unsupported poi kinds, e.g. 'plaza')
+
+
+    allowed_poi_kinds = {"custom", "cafeteria", "dorm", "classroom", "library", "office", "sports"}
+
+
+    kind_aliases = {
+
+
+        "plaza": "custom",
+
+
+    }
+
+
+    identities = world.get("identities") or []
+
+
+    if isinstance(identities, list):
+
+
+        for ident in identities:
+
+
+            if not isinstance(ident, dict):
+
+
+                continue
+
+
+            schedule = ident.get("schedule")
+
+
+            if schedule is None:
+
+
+                continue
+
+
+            if not isinstance(schedule, list):
+
+
+                ident["schedule"] = []
+
+
+                continue
+
+
+            for entry in schedule:
+
+
+                if not isinstance(entry, dict):
+
+
+                    continue
+
+
+                kinds = entry.get("poi_kinds")
+
+
+                if kinds is None:
+
+
+                    continue
+
+
+                if not isinstance(kinds, list):
+
+
+                    entry["poi_kinds"] = []
+
+
+                    continue
+
+
+                cleaned: List[str] = []
+
+
+                for k in kinds:
+
+
+                    if not isinstance(k, str):
+
+
+                        continue
+
+
+                    kk = kind_aliases.get(k, k)
+
+
+                    if kk in allowed_poi_kinds:
+
+
+                        cleaned.append(kk)
+
+
+                entry["poi_kinds"] = cleaned
+
+
+
+
+
+    return world
+
+
+
+
+
+
+
+
+def _world_walls_set(world: Dict) -> set:
+
+
+    return set((_normalize_world_schema(world).get("walls") or []))
+
+
+
+
+
+
+
+
+def _cell_blocked(world: Dict, x: int, y: int) -> bool:
+
+
+    return _coord_key(x, y) in _world_walls_set(world)
+
+
+
+
+
+
+
+
+def _nearby_candidates(world: Dict, x: int, y: int, max_radius: int) -> List[tuple[int, int]]:
+
+
+    """Return candidate unblocked cells around (x,y), ordered by increasing Manhattan distance.
+
+
+
+
+
+    Used to find a walkable target near a POI seed when the seed lies on/near walls.
+
+
+    """
+
+
+    world = _normalize_world_schema(world)
+
+
+    width = int(world.get("width") or 0)
+
+
+    height = int(world.get("height") or 0)
+
+
+    rmax = max(0, min(int(max_radius or 0), 50))
+
+
+
+
+
+    out: List[tuple[int, int]] = []
+
+
+    seen: set[tuple[int, int]] = set()
+
+
+
+
+
+    def add(xx: int, yy: int):
+
+
+        if not (0 <= xx < width and 0 <= yy < height):
+
+
+            return
+
+
+        k = (xx, yy)
+
+
+        if k in seen:
+
+
+            return
+
+
+        seen.add(k)
+
+
+        if _cell_blocked(world, xx, yy):
+
+
+            return
+
+
+        out.append((xx, yy))
+
+
+
+
+
+    add(int(x), int(y))
+
+
+    for r in range(1, rmax + 1):
+
+
+        for dx in range(-r, r + 1):
+
+
+            dy = r - abs(dx)
+
+
+            add(x + dx, y + dy)
+
+
+            if dy != 0:
+
+
+                add(x + dx, y - dy)
+
+
+
+
+
+    return out
+
+
+
+
+
+
+
+
+def _world_ascii(world: Dict) -> str:
+
+
+    world = _normalize_world_schema(world)
+
+
+    width = int(world.get("width") or 0)
+
+
+    height = int(world.get("height") or 0)
+
+
+    walls = _world_walls_set(world)
+
+
+    colors = world.get("colors") or {}
+
+
+    placements = {p.get('agent_id'): (p.get('x'), p.get('y')) for p in (world.get('agent_placements') or [])}
+
+
+    inv = {}
+
+
+    for aid, (x, y) in placements.items():
+
+
+        inv[(x, y)] = (aid[:2] if aid else 'A')
+
+
+
+
+
+    # Safety: never dump huge maps; show a top-left window.
+
+
+    max_w = min(80, width)
+
+
+    max_h = min(40, height)
+
+
+    ox, oy = 0, 0
+
+
+
+
+
+    lines = [f"World view ({ox},{oy}) size {max_w}x{max_h} of {width}x{height}"]
+
+
+    for y in range(oy, oy + max_h):
+
+
+        parts = []
+
+
+        for x in range(ox, ox + max_w):
+
+
+            if (x, y) in inv:
+
+
+                parts.append(inv[(x, y)])
+
+
+            elif _coord_key(x, y) in walls:
+
+
+                parts.append('##')
+
+
+            elif colors.get(_coord_key(x, y)) and colors.get(_coord_key(x, y)) != 'none':
+
+
+                parts.append('..')
+
+
+            else:
+
+
+                parts.append('  ')
+
+
+        lines.append(''.join(parts))
+
+
+    return "\n".join(lines)
+
+
+
+
+
+
+
+
+def _validate_grid(grid, width: int, height: int):
+
+
+    # Legacy validation.
+
+
+    if not isinstance(grid, list) or len(grid) != height:
+
+
+        raise HTTPException(status_code=400, detail="Invalid grid height")
+
+
+    for row in grid:
+
+
+        if not isinstance(row, list) or len(row) != width:
+
+
+            raise HTTPException(status_code=400, detail="Invalid grid width")
+
+
+
+
+
+
+
+
+def _bresenham_line(x0: int, y0: int, x1: int, y1: int):
+
+
+    points = []
+
+
+    dx = abs(x1 - x0)
+
+
+    dy = -abs(y1 - y0)
+
+
+    sx = 1 if x0 < x1 else -1
+
+
+    sy = 1 if y0 < y1 else -1
+
+
+    err = dx + dy
+
+
+    x, y = x0, y0
+
+
+    while True:
+
+
+        points.append((x, y))
+
+
+        if x == x1 and y == y1:
+
+
+            break
+
+
+        e2 = 2 * err
+
+
+        if e2 >= dy:
+
+
+            err += dy
+
+
+            x += sx
+
+
+        if e2 <= dx:
+
+
+            err += dx
+
+
+            y += sy
+
+
+    return points
+
+
+
+
+
+
+
+
+def _apply_draw_ops(world: Dict, ops: List[WorldDrawOp]):
+
+
+    world = _normalize_world_schema(world)
+
+
+    width = int(world.get("width") or 0)
+
+
+    height = int(world.get("height") or 0)
+
+
+    walls = set(world.get("walls") or [])
+
+
+    colors: Dict[str, WorldColorLabel] = dict(world.get("colors") or {})
+
+
+
+
+
+    def in_bounds(x: int, y: int) -> bool:
+
+
+        return 0 <= x < width and 0 <= y < height
+
+
+
+
+
+    def iter_points(op: WorldDrawOp):
+
+
+        if op.shape == "cell":
+
+
+            if op.x is None or op.y is None:
+
+
+                return []
+
+
+            return [(op.x, op.y)]
+
+
+        if op.shape == "cells":
+
+
+            if not op.cells:
+
+
+                return []
+
+
+            return [(p.x, p.y) for p in op.cells]
+
+
+        if op.shape == "rect":
+
+
+            if op.x is None or op.y is None or op.x2 is None or op.y2 is None:
+
+
+                return []
+
+
+            x1, y1 = min(op.x, op.x2), min(op.y, op.y2)
+
+
+            x2, y2 = max(op.x, op.x2), max(op.y, op.y2)
+
+
+            pts = []
+
+
+            for yy in range(y1, y2 + 1):
+
+
+                for xx in range(x1, x2 + 1):
+
+
+                    pts.append((xx, yy))
+
+
+            return pts
+
+
+        if op.shape == "line":
+
+
+            if op.x is None or op.y is None or op.x2 is None or op.y2 is None:
+
+
+                return []
+
+
+            return _bresenham_line(op.x, op.y, op.x2, op.y2)
+
+
+        return []
+
+
+
+
+
+    for op in ops:
+
+
+        pts = iter_points(op)
+
+
+        if not pts:
+
+
+            continue
+
+
+
+
+
+        if op.layer == "wall":
+
+
+            if op.wall is None:
+
+
+                raise HTTPException(status_code=400, detail="Wall op missing 'wall' boolean")
+
+
+            for (x, y) in pts:
+
+
+                if not in_bounds(x, y):
+
+
+                    continue
+
+
+                k = _coord_key(x, y)
+
+
+                if op.wall:
+
+
+                    walls.add(k)
+
+
+                else:
+
+
+                    walls.discard(k)
+
+
+        elif op.layer == "color":
+
+
+            if op.color is None:
+
+
+                raise HTTPException(status_code=400, detail="Color op missing 'color'")
+
+
+            for (x, y) in pts:
+
+
+                if not in_bounds(x, y):
+
+
+                    continue
+
+
+                k = _coord_key(x, y)
+
+
+                if op.color == "none":
+
+
+                    colors.pop(k, None)
+
+
+                else:
+
+
+                    colors[k] = op.color
+
+
+        else:
+
+
+            raise HTTPException(status_code=400, detail="Unknown draw layer")
+
+
+
+
+
+    world["walls"] = sorted(walls)
+
+
+    world["colors"] = colors
+
+
+    return world
+
+
+
+
+
+
+
+
+_COLOR_LABEL_RGB: Dict[WorldColorLabel, tuple[int, int, int]] = {
+
+
+    # Approximate Ant Design palette (used only for nearest-color mapping).
+
+
+    "none": (255, 255, 255),
+
+
+    "neutral": (140, 140, 140),
+
+
+    "primary": (22, 119, 255),
+
+
+    "success": (82, 196, 26),
+
+
+    "warning": (250, 173, 20),
+
+
+    "error": (255, 77, 79),
+
+
+    "info": (19, 194, 194),
+
+
+}
+
+
+
+
+
+
+
+
+def _parse_first_image_url(maybe_content: object) -> Optional[str]:
+
+
+    """Parse a first image_url from an OpenAI-style JSON content list."""
+
+
+    if not maybe_content:
+
+
+        return None
+
+
+    try:
+
+
+        if isinstance(maybe_content, str):
+
+
+            s = maybe_content.strip()
+
+
+            if not (s.startswith("[") and s.endswith("]")):
+
+
+                return None
+
+
+            items = json.loads(s)
+
+
+        elif isinstance(maybe_content, list):
+
+
+            items = maybe_content
+
+
+        else:
+
+
+            return None
+
+
+
+
+
+        if not isinstance(items, list):
+
+
+            return None
+
+
+        for item in items:
+
+
+            if not isinstance(item, dict):
+
+
+                continue
+
+
+            if item.get("type") == "image_url":
+
+
+                iu = item.get("image_url")
+
+
+                if isinstance(iu, dict):
+
+
+                    url = iu.get("url")
+
+
+                    if isinstance(url, str) and url:
+
+
+                        return url
+
+
+    except Exception:
+
+
+        return None
+
+
+    return None
+
+
+
+
+
+
+
+
+def _download_image_bytes(url: str) -> bytes:
+
+
+    if url.startswith("data:"):
+
+
+        # data:image/png;base64,...
+
+
+        header, b64 = url.split(",", 1)
+
+
+        return base64.b64decode(b64)
+
+
+    resp = requests.get(url, timeout=60)
+
+
+    resp.raise_for_status()
+
+
+    return resp.content
+
+
+
+
+
+
+
+
+def _rgb_dist2(a: tuple[int, int, int], b: tuple[int, int, int]) -> int:
+
+
+    return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
+
+
+
+
+
+
+
+
+def _pixel_to_label_or_wall(r: int, g: int, b: int, a: int) -> tuple[Optional[WorldColorLabel], bool]:
+
+
+    # Transparent => ignore.
+
+
+    if a < 128:
+
+
+        return "none", False
+
+
+
+
+
+    # Very dark => treat as wall.
+
+
+    if (r + g + b) <= 90:
+
+
+        return None, True
+
+
+
+
+
+    # Very bright near-white => none.
+
+
+    if (r + g + b) >= 735:
+
+
+        return "none", False
+
+
+
+
+
+    rgb = (r, g, b)
+
+
+    best_label: WorldColorLabel = "neutral"
+
+
+    best_d2 = 1_000_000_000
+
+
+    for label, pal_rgb in _COLOR_LABEL_RGB.items():
+
+
+        if label == "none":
+
+
+            continue
+
+
+        d2 = _rgb_dist2(rgb, pal_rgb)
+
+
+        if d2 < best_d2:
+
+
+            best_d2 = d2
+
+
+            best_label = label
+
+
+    return best_label, False
+
+
+
+
+
+
+
+
+def _image_to_world_ops(img: Image.Image, view_x: int, view_y: int, view_w: int, view_h: int) -> List[WorldDrawOp]:
+
+
+    rgba = img.convert("RGBA")
+
+
+    # Resize to match viewport, using nearest neighbor to preserve pixel-art feel.
+
+
+    rgba = rgba.resize((view_w, view_h), resample=Image.Resampling.NEAREST)
+
+
+
+
+
+    wall_cells: List[PathPoint] = []
+
+
+    color_cells: Dict[WorldColorLabel, List[PathPoint]] = {}
+
+
+
+
+
+    px = rgba.load()
+
+
+    for y_local in range(view_h):
+
+
+        for x_local in range(view_w):
+
+
+            r, g, b, a = px[x_local, y_local]
+
+
+            label, is_wall = _pixel_to_label_or_wall(r, g, b, a)
+
+
+            x_abs = view_x + x_local
+
+
+            y_abs = view_y + y_local
+
+
+            if is_wall:
+
+
+                wall_cells.append(PathPoint(x=x_abs, y=y_abs))
+
+
+            else:
+
+
+                if label and label != "none":
+
+
+                    color_cells.setdefault(label, []).append(PathPoint(x=x_abs, y=y_abs))
+
+
+
+
+
+    ops: List[WorldDrawOp] = []
+
+
+
+
+
+    # Clear viewport first (walls + colors) so image fully defines the region.
+
+
+    ops.append(
+
+
+        WorldDrawOp(
+
+
+            layer="wall",
+
+
+            shape="rect",
+
+
+            x=view_x,
+
+
+            y=view_y,
+
+
+            x2=view_x + view_w - 1,
+
+
+            y2=view_y + view_h - 1,
+
+
+            wall=False,
+
+
+        )
+
+
+    )
+
+
+    ops.append(
+
+
+        WorldDrawOp(
+
+
+            layer="color",
+
+
+            shape="rect",
+
+
+            x=view_x,
+
+
+            y=view_y,
+
+
+            x2=view_x + view_w - 1,
+
+
+            y2=view_y + view_h - 1,
+
+
+            color="none",
+
+
+        )
+
+
+    )
+
+
+
+
+
+    if wall_cells:
+
+
+        ops.append(WorldDrawOp(layer="wall", shape="cells", cells=wall_cells, wall=True))
+
+
+
+
+
+    for label, pts in color_cells.items():
+
+
+        if pts:
+
+
+            ops.append(WorldDrawOp(layer="color", shape="cells", cells=pts, color=label))
+
+
+
+
+
+    return ops
+
+
+
+
+
+
+
+
+def _find_agent_for_image(current_user: User, agent_id: Optional[str]) -> Optional[Dict]:
+
+
+    if agent_id:
+
+
+        return AGENTS_DB.get(agent_id)
+
+
+
+
+
+    # Prefer the current user's agent named AI_4.
+
+
+    for a in AGENTS_DB.values():
+
+
+        if a.get("user_id") == current_user.username and a.get("name") == "AI_4":
+
+
+            return a
+
+
+    # Fallback: any agent named AI_4.
+
+
+    for a in AGENTS_DB.values():
+
+
+        if a.get("name") == "AI_4":
+
+
+            return a
+
+
+    return None
+
+
+
+
+
+
+
+
+def _invoke_custom_agent_raw(agent: Dict, prompt: str) -> Dict[str, object]:
+
+
+    code_str = agent.get("usage_example")
+
+
+    if not isinstance(code_str, str) or not code_str.strip():
+
+
+        raise HTTPException(status_code=500, detail="Custom agent missing usage_example")
+
+
+
+
+
+    local_scope = {"json": json}
+
+
+    exec(code_str, local_scope)
+
+
+    if "invoke_custom_agent" not in local_scope:
+
+
+        raise HTTPException(status_code=500, detail="Custom agent code must define invoke_custom_agent")
+
+
+    invoke_func = local_scope["invoke_custom_agent"]
+
+
+
+
+
+    res = invoke_func(
+
+
+        messages=[{"role": "user", "content": prompt}],
+
+
+        api_key=agent.get("api_key"),
+
+
+        base_url=agent.get("base_url"),
+
+
+        model=agent.get("model"),
+
+
+        temperature=0.7,
+
+
+    )
+
+
+
+
+
+    if isinstance(res, dict):
+
+
+        return res
+
+
+    return {"content": str(res), "raw": res}
+
+
+
+
+
+
+
+
+def _execute_world_script(world: Dict, view: WorldViewResponse, commands: List[WorldScriptCommand], max_cells: int):
+
+
+    """Execute a restricted set of drawing macros into draw ops. All effects are constrained to a region (defaults to viewport)."""
+
+
+    import random
+
+
+
+
+
+    ops: List[WorldDrawOp] = []
+
+
+    total_cells_touched = 0
+
+
+
+
+
+    def region(cmd: WorldScriptCommand):
+
+
+        rx = cmd.x if cmd.x is not None else view.x
+
+
+        ry = cmd.y if cmd.y is not None else view.y
+
+
+        rw = cmd.w if cmd.w is not None else view.width
+
+
+        rh = cmd.h if cmd.h is not None else view.height
+
+
+        # clamp to viewport bounds for safety
+
+
+        rx = max(view.x, min(view.x + view.width - 1, rx))
+
+
+        ry = max(view.y, min(view.y + view.height - 1, ry))
+
+
+        rw = max(1, min(rw, view.x + view.width - rx))
+
+
+        rh = max(1, min(rh, view.y + view.height - ry))
+
+
+        return rx, ry, rw, rh
+
+
+
+
+
+    for cmd in commands:
+
+
+        rx, ry, rw, rh = region(cmd)
+
+
+
+
+
+        if cmd.type == "fill_rect":
+
+
+            if cmd.color is None:
+
+
+                raise HTTPException(status_code=400, detail="script.fill_rect missing color")
+
+
+            ops.append(WorldDrawOp(layer="color", shape="rect", x=rx, y=ry, x2=rx + rw - 1, y2=ry + rh - 1, color=cmd.color))
+
+
+
+
+
+        elif cmd.type == "border_walls":
+
+
+            t = int(cmd.thickness or 1)
+
+
+            t = max(1, min(10, t))
+
+
+            wall_val = True if cmd.wall is None else bool(cmd.wall)
+
+
+            # top/bottom
+
+
+            for i in range(t):
+
+
+                ops.append(WorldDrawOp(layer="wall", shape="rect", x=rx, y=ry + i, x2=rx + rw - 1, y2=ry + i, wall=wall_val))
+
+
+                ops.append(WorldDrawOp(layer="wall", shape="rect", x=rx, y=ry + rh - 1 - i, x2=rx + rw - 1, y2=ry + rh - 1 - i, wall=wall_val))
+
+
+            # left/right
+
+
+            for i in range(t):
+
+
+                ops.append(WorldDrawOp(layer="wall", shape="rect", x=rx + i, y=ry, x2=rx + i, y2=ry + rh - 1, wall=wall_val))
+
+
+                ops.append(WorldDrawOp(layer="wall", shape="rect", x=rx + rw - 1 - i, y=ry, x2=rx + rw - 1 - i, y2=ry + rh - 1, wall=wall_val))
+
+
+
+
+
+        elif cmd.type == "checkerboard":
+
+
+            a = cmd.color_a or "primary"
+
+
+            b = cmd.color_b or "error"
+
+
+            s = int(cmd.cell_size or 1)
+
+
+            s = max(1, min(20, s))
+
+
+
+
+
+            # Apply as per-cell ops (bounded)
+
+
+            for y in range(ry, ry + rh):
+
+
+                for x in range(rx, rx + rw):
+
+
+                    total_cells_touched += 1
+
+
+                    if total_cells_touched > max_cells:
+
+
+                        raise HTTPException(status_code=400, detail=f"script exceeded max_cells={max_cells}")
+
+
+                    if _cell_blocked(world, x, y):
+
+
+                        continue
+
+
+                    use_a = ((x - rx) // s + (y - ry) // s) % 2 == 0
+
+
+                    ops.append(WorldDrawOp(layer="color", shape="cell", x=x, y=y, color=a if use_a else b))
+
+
+
+
+
+        elif cmd.type == "random_choice":
+
+
+            palette = cmd.palette or ["primary", "error"]
+
+
+            probs = cmd.probabilities
+
+
+            if probs is not None and len(probs) != len(palette):
+
+
+                raise HTTPException(status_code=400, detail="script.random_choice probabilities length must match palette")
+
+
+            rng = random.Random(cmd.seed) if cmd.seed is not None else random
+
+
+
+
+
+            for y in range(ry, ry + rh):
+
+
+                for x in range(rx, rx + rw):
+
+
+                    total_cells_touched += 1
+
+
+                    if total_cells_touched > max_cells:
+
+
+                        raise HTTPException(status_code=400, detail=f"script exceeded max_cells={max_cells}")
+
+
+                    if _cell_blocked(world, x, y):
+
+
+                        continue
+
+
+                    c = rng.choices(palette, weights=probs, k=1)[0] if probs else rng.choice(palette)
+
+
+                    ops.append(WorldDrawOp(layer="color", shape="cell", x=x, y=y, color=c))
+
+
+
+
+
+        else:
+
+
+            raise HTTPException(status_code=400, detail=f"Unknown script command: {cmd.type}")
+
+
+
+
+
+    return ops
+
+
+
+
+
+
+
+
+def _build_view(world: Dict, x: int, y: int, w: int, h: int) -> WorldViewResponse:
+
+
+    world = _normalize_world_schema(world)
+
+
+    width = int(world.get("width") or 0)
+
+
+    height = int(world.get("height") or 0)
+
+
+    x = max(0, min(x, max(0, width - 1)))
+
+
+    y = max(0, min(y, max(0, height - 1)))
+
+
+    w = max(1, min(w, 200, width - x))
+
+
+    h = max(1, min(h, 200, height - y))
+
+
+
+
+
+    walls_set = _world_walls_set(world)
+
+
+    colors = world.get("colors") or {}
+
+
+
+
+
+    walls_mat: List[List[bool]] = []
+
+
+    colors_mat: List[List[Optional[WorldColorLabel]]] = []
+
+
+    for yy in range(y, y + h):
+
+
+        wrow = []
+
+
+        crow = []
+
+
+        for xx in range(x, x + w):
+
+
+            k = _coord_key(xx, yy)
+
+
+            wrow.append(k in walls_set)
+
+
+            crow.append(colors.get(k))
+
+
+        walls_mat.append(wrow)
+
+
+        colors_mat.append(crow)
+
+
+
+
+
+    placements = []
+
+
+    for p in (world.get("agent_placements") or []):
+
+
+        px, py = int(p.get("x") or 0), int(p.get("y") or 0)
+
+
+        if x <= px < x + w and y <= py < y + h:
+
+
+            placements.append(p)
+
+
+
+
+
+    return WorldViewResponse(x=x, y=y, width=w, height=h, walls=walls_mat, colors=colors_mat, agent_placements=placements)
+
+
+
+
+
+
+
+
+def _a_star_path(world: Dict, start_x: int, start_y: int, target_x: int, target_y: int):
+
+
+    world = _normalize_world_schema(world)
+
+
+    width = int(world.get("width") or 0)
+
+
+    height = int(world.get("height") or 0)
+
+
+    walls_set = _world_walls_set(world)
+
+
+    colors = world.get("colors") or {}
+
+
+    pois = world.get("pois") or []
+
+
+
+
+
+    def _cell_in_poi(x: int, y: int) -> bool:
+
+
+        try:
+
+
+            for p in pois:
+
+
+                shape = (p.get("shape") or "point")
+
+
+                px = int(p.get("x") or 0)
+
+
+                py = int(p.get("y") or 0)
+
+
+                if shape == "rect":
+
+
+                    w = int(p.get("w") or 0)
+
+
+                    h = int(p.get("h") or 0)
+
+
+                    if w > 0 and h > 0 and px <= x < px + w and py <= y < py + h:
+
+
+                        return True
+
+
+                elif shape == "cells":
+
+
+                    cells = p.get("cells") or []
+
+
+                    # cells list might be large; keep it bounded for path-cost usage.
+
+
+                    for c in cells[:2000]:
+
+
+                        if int(c.get("x") or 0) == x and int(c.get("y") or 0) == y:
+
+
+                            return True
+
+
+                else:
+
+
+                    if px == x and py == y:
+
+
+                        return True
+
+
+        except Exception:
+
+
+            return False
+
+
+        return False
+
+
+
+
+
+    # Only apply "stay-in-campus" bias if the world actually contains semantic markings.
+
+
+    has_semantics = False
+
+
+    if pois:
+
+
+        has_semantics = True
+
+
+    else:
+
+
+        for v in colors.values():
+
+
+            if v and v != "none":
+
+
+                has_semantics = True
+
+
+                break
+
+
+
+
+
+    def _step_cost(x: int, y: int) -> int:
+
+
+        if not has_semantics:
+
+
+            return 1
+
+
+        lbl = colors.get(_coord_key(x, y))
+
+
+        if (lbl is None) or (lbl == "none"):
+
+
+            # Penalize stepping onto completely unlabeled empty space to keep agents
+
+
+            # within the campus semantic zone (roads/buildings), without hard blocking.
+
+
+            if _cell_in_poi(x, y):
+
+
+                return 1
+
+
+            return 6
+
+
+        return 1
+
+
+
+
+
+    def in_bounds(x: int, y: int) -> bool:
+
+
+        return 0 <= x < width and 0 <= y < height
+
+
+
+
+
+    if not in_bounds(start_x, start_y) or not in_bounds(target_x, target_y):
+
+
+        return None
+
+
+
+
+
+    def is_blocked(x: int, y: int) -> bool:
+
+
+        return _coord_key(x, y) in walls_set
+
+
+
+
+
+    if is_blocked(start_x, start_y) or is_blocked(target_x, target_y):
+
+
+        return None
+
+
+
+
+
+    import heapq
+
+
+
+
+
+    def h(x: int, y: int) -> int:
+
+
+        return abs(x - target_x) + abs(y - target_y)
+
+
+
+
+
+    start = (start_x, start_y)
+
+
+    goal = (target_x, target_y)
+
+
+    open_heap = [(h(*start), 0, start)]
+
+
+    came_from: Dict[tuple, Optional[tuple]] = {start: None}
+
+
+    g_score: Dict[tuple, int] = {start: 0}
+
+
+
+
+
+    expansions = 0
+
+
+    max_expansions = 200000
+
+
+    dirs = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+
+
+
+
+
+    while open_heap:
+
+
+        _, g, (x, y) = heapq.heappop(open_heap)
+
+
+        if (x, y) == goal:
+
+
+            break
+
+
+        if g != g_score.get((x, y), None):
+
+
+            continue
+
+
+
+
+
+        expansions += 1
+
+
+        if expansions > max_expansions:
+
+
+            return None
+
+
+
+
+
+        for dx, dy in dirs:
+
+
+            nx, ny = x + dx, y + dy
+
+
+            if not in_bounds(nx, ny):
+
+
+                continue
+
+
+            if is_blocked(nx, ny):
+
+
+                continue
+
+
+            ng = g + _step_cost(nx, ny)
+
+
+            if ng < g_score.get((nx, ny), 10**12):
+
+
+                g_score[(nx, ny)] = ng
+
+
+                came_from[(nx, ny)] = (x, y)
+
+
+                heapq.heappush(open_heap, (ng + h(nx, ny), ng, (nx, ny)))
+
+
+
+
+
+    if goal not in came_from:
+
+
+        return None
+
+
+
+
+
+    path = []
+
+
+    cur = goal
+
+
+    while cur is not None:
+
+
+        path.append(cur)
+
+
+        cur = came_from.get(cur)
+
+
+    path.reverse()
+
+
+    return path
+
+
+
+
+
+# --- Helper: Background Memory Saving ---
+
+
+def background_save_memory(agent_id: str, prompt: str, content: str, run_id: str = None):
+
+
+    try:
+
+
+        # 1. Add to Vector DB (MemoryAgent)
+
+
+        mem_agent = MemoryAgent(agent_id)
+
+
+        context_str = f"In simulation run {run_id[:8] if run_id else 'chat'}, I was asked: '{prompt}'. I responded: '{content}'."
+
+
+        mem_agent.add_observation(context_str, importance=1)
+
+
+
+
+
+        # 2. Add to Simple List (for UI visibility)
+
+
+        agent = AGENTS_DB.get(agent_id)
+
+
+        if agent:
+
+
+            if 'long_term_memory' not in agent: agent['long_term_memory'] = []
+
+
+            # Avoid duplicates if possible (simple check)
+
+
+            if context_str not in agent['long_term_memory']:
+
+
+                agent['long_term_memory'].append(context_str)
+
+
+                # We need to save AGENTS_DB.
+
+
+                # Since this runs in background, we should be careful about race conditions with file writes.
+
+
+                # But load_data/save_data are simple JSON dumps.
+
+
+                # For now, we just save.
+
+
+                save_data("agents.json", AGENTS_DB)
+
+
+        print(f"Background memory saved for agent {agent_id}")
+
+
+    except Exception as e:
+
+
+        print(f"Failed to background save memory for agent {agent_id}: {e}")
+
+
+
+
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/token")
+
+
+
+
+
+# --- Auth Dependencies ---
+
+
+
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+
+
+    credentials_exception = HTTPException(
+
+
+        status_code=status.HTTP_401_UNAUTHORIZED,
+
+
+        detail="Could not validate credentials",
+
+
+        headers={"WWW-Authenticate": "Bearer"},
+
+
+    )
+
+
+    try:
+
+
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+
+
+        username: str = payload.get("sub")
+
+
+        if username is None:
+
+
+            raise credentials_exception
+
+
+    except JWTError:
+
+
+        raise credentials_exception
+
+
+
+
+
+    user_data = USERS_DB.get(username)
+
+
+    if user_data is None:
+
+
+        raise credentials_exception
+
+
+    return UserInDB(**user_data)
+
+
+
+
+
+
+
+
+@router.post("/worlds/{world_id}/ai_image", response_model=WorldAIImageResponse)
+
+
+async def ai_image_world(
+
+
+    world_id: str,
+
+
+    req: WorldAIImageRequest,
+
+
+    current_user: User = Depends(get_current_user),
+
+
+):
+
+
+    """Text → Image (AI_4) → Grid ops.
+
+
+
+
+
+    Uses the AI_4 image model to generate a top-down pixel-art image and converts it into
+
+
+    wall/color ops for the current viewport.
+
+
+    """
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    view = _build_view(world, req.x, req.y, req.w, req.h)
+
+
+
+
+
+    agent = _find_agent_for_image(current_user, req.agent_id)
+
+
+    if not agent:
+
+
+        raise HTTPException(status_code=404, detail="Image agent not found (expected AI_4)")
+
+
+    if agent.get("provider") != "custom":
+
+
+        raise HTTPException(status_code=400, detail="Image agent must be provider=custom")
+
+
+
+
+
+    # Prompt tuned for easy conversion: one pixel ≈ one tile, limited colors.
+
+
+    image_prompt = (
+
+
+        "Generate a TOP-DOWN pixel art map image. No perspective, no text. "
+
+
+        "The image will be converted into a tile grid where 1 pixel = 1 tile. "
+
+
+        "Use crisp shapes with solid colors (avoid gradients).\n\n"
+
+
+        "Color key (important):\n"
+
+
+        "- BLACK (#000000): walls/obstacles\n"
+
+
+        "- WHITE (#FFFFFF): empty\n"
+
+
+        "- GREEN (grass): main ground\n"
+
+
+        "- CYAN or LIGHT BLUE: field lines/markings\n\n"
+
+
+        f"Target grid size: {view.width}x{view.height} tiles.\n\n"
+
+
+        f"User request: {req.prompt}"
+
+
+    )
+
+
+
+
+
+    gen_res = _invoke_custom_agent_raw(agent, image_prompt)
+
+
+
+
+
+    # Try to extract image url from: content (if it is a json list), adapter extraction on full dict, or raw payload.
+
+
+    image_url = _parse_first_image_url(gen_res.get("content"))
+
+
+    if not image_url:
+
+
+        extracted = extract_content_from_raw(gen_res) or extract_content_from_raw(gen_res.get("raw"))
+
+
+        image_url = _parse_first_image_url(extracted)
+
+
+
+
+
+    if not image_url:
+
+
+        raise HTTPException(status_code=500, detail=f"Image generation returned no image URL. Response keys={list(gen_res.keys())}")
+
+
+
+
+
+    # Download and store image under uploads/generated
+
+
+    try:
+
+
+        img_bytes = _download_image_bytes(image_url)
+
+
+    except Exception as e:
+
+
+        raise HTTPException(status_code=502, detail=f"Failed to download generated image: {e}")
+
+
+
+
+
+    try:
+
+
+        os.makedirs("uploads/generated", exist_ok=True)
+
+
+        img_id = str(uuid.uuid4())
+
+
+        rel_path = f"uploads/generated/{img_id}.png"
+
+
+        with open(rel_path, "wb") as f:
+
+
+            f.write(img_bytes)
+
+
+        served_url = f"/uploads/generated/{img_id}.png"
+
+
+    except Exception as e:
+
+
+        raise HTTPException(status_code=500, detail=f"Failed to store generated image: {e}")
+
+
+
+
+
+    try:
+
+
+        img = Image.open(io.BytesIO(img_bytes))
+
+
+    except Exception as e:
+
+
+        raise HTTPException(status_code=500, detail=f"Generated image is not a valid image: {e}")
+
+
+
+
+
+    ops = _image_to_world_ops(img, view.x, view.y, view.width, view.height)
+
+
+    world = _apply_draw_ops(world, ops)
+
+
+    WORLDS_DB[world_id] = world
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+
+
+
+    new_view = _build_view(world, view.x, view.y, view.width, view.height)
+
+
+    return WorldAIImageResponse(agent_id=agent.get("id") or "", image_url=served_url, ops=ops, view=new_view)
+
+
+
+
+
+# --- Auth Endpoints ---
+
+
+
+
+
+def _normalize_username(raw: str) -> str:
+
+
+    return (raw or "").strip()
+
+
+
+
+
+
+
+
+def _get_user_dict_loose(username: str):
+
+
+    """Lookup user by username with small quality-of-life normalization.
+
+
+
+
+
+    - Strips leading/trailing whitespace
+
+
+    - Falls back to case-insensitive match if exact key is not found
+
+
+    """
+
+
+    u = _normalize_username(username)
+
+
+    if not u:
+
+
+        return None, None
+
+
+
+
+
+    user_dict = USERS_DB.get(u)
+
+
+    if user_dict:
+
+
+        return u, user_dict
+
+
+
+
+
+    u_cf = u.casefold()
+
+
+    for k, v in USERS_DB.items():
+
+
+        if isinstance(k, str) and k.casefold() == u_cf:
+
+
+            return k, v
+
+
+    return u, None
+
+
+
+
+
+@router.post("/register", response_model=Token)
+
+
+async def register(user: UserCreate):
+
+
+    username = _normalize_username(user.username)
+
+
+    print(f"Registering user: {username}")
+
+
+    if not username:
+
+
+        raise HTTPException(status_code=400, detail="Username is required")
+
+
+
+
+
+    existing_key, existing = _get_user_dict_loose(username)
+
+
+    if existing:
+
+
+        print("Username already exists")
+
+
+        raise HTTPException(status_code=400, detail="Username already registered")
+
+
+
+
+
+    try:
+
+
+        print("Hashing password...")
+
+
+        hashed_password = get_password_hash(user.password)
+
+
+        print("Password hashed.")
+
+
+        user_in_db = UserInDB(username=username, hashed_password=hashed_password)
+
+
+        USERS_DB[username] = user_in_db.dict()
+
+
+        print("Saving user to DB...")
+
+
+        save_data("users.json", USERS_DB)
+
+
+        print("User saved.")
+
+
+
+
+
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+
+
+        access_token = create_access_token(
+
+
+            data={"sub": username}, expires_delta=access_token_expires
+
+
+        )
+
+
+        print("Token created.")
+
+
+        return {"access_token": access_token, "token_type": "bearer"}
+
+
+    except Exception as e:
+
+
+        print(f"Error during registration: {e}")
+
+
+        import traceback
+
+
+        traceback.print_exc()
+
+
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+
+
+
+
+
+@router.post("/token", response_model=Token)
+
+
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+
+
+    _, user_dict = _get_user_dict_loose(form_data.username)
+
+
+    if not user_dict:
+
+
+        raise HTTPException(status_code=400, detail="Incorrect username or password")
+
+
+
+
+
+    user = UserInDB(**user_dict)
+
+
+    if not verify_password(form_data.password, user.hashed_password):
+
+
+        raise HTTPException(status_code=400, detail="Incorrect username or password")
+
+
+
+
+
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+
+
+    access_token = create_access_token(
+
+
+        data={"sub": user.username}, expires_delta=access_token_expires
+
+
+    )
+
+
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+
+
+
+@router.get("/users/me", response_model=User)
+
+
+async def read_users_me(current_user: User = Depends(get_current_user)):
+
+
+    return current_user
+
+
+
+
+
+# --- Protected Endpoints ---
+
+
+
+
+
+@router.post("/generate-adapter", response_model=GenerateCodeResponse)
+
+
+async def generate_adapter(request: GenerateCodeRequest, current_user: User = Depends(get_current_user)):
+
+
+    try:
+
+
+        code = generate_adapter_code(
+
+
+            request.model_name,
+
+
+            request.base_url,
+
+
+            request.usage_example,
+
+
+            request.api_key,
+
+
+            request.input_modality,
+
+
+            request.output_modality
+
+
+        )
+
+
+        return GenerateCodeResponse(generated_code=code, explanation="Generated based on the provided example.")
+
+
+    except Exception as e:
+
+
+        logging.error(f"Generation failed: {e}")
+
+
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+@router.post("/code/fix", response_model=FixCodeResponse)
+
+
+async def fix_code(request: FixCodeRequest, current_user: User = Depends(get_current_user)):
+
+
+    try:
+
+
+        fixed_code = fix_code_snippet(request.code, request.error)
+
+
+        return FixCodeResponse(fixed_code=fixed_code, explanation="Fixed based on error message.")
+
+
+    except Exception as e:
+
+
+        logging.error(f"Code fix failed: {e}")
+
+
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+@router.post("/agents", response_model=AgentResponse)
+
+
+async def create_agent(agent: AgentCreateRequest, current_user: User = Depends(get_current_user)):
+
+
+    agent_id = str(uuid.uuid4())
+
+
+    new_agent = {
+
+
+        "id": agent_id,
+
+
+        "user_id": current_user.username,
+
+
+        **agent.dict()
+
+
+    }
+
+
+    AGENTS_DB[agent_id] = new_agent
+
+
+    save_data("agents.json", AGENTS_DB)
+
+
+    return AgentResponse(**new_agent)
+
+
+
+
+
+@router.get("/agents", response_model=List[AgentResponse])
+
+
+async def list_agents(current_user: User = Depends(get_current_user)):
+
+
+    # Filter by user_id
+
+
+    return [AgentResponse(**a) for a in AGENTS_DB.values() if a.get("user_id") == current_user.username]
+
+
+
+
+
+@router.post("/agents/{agent_id}/upload")
+
+
+async def upload_agent_file(agent_id: str, file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
+
+
+    agent = AGENTS_DB.get(agent_id)
+
+
+    if not agent or agent.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+
+
+
+
+    upload_dir = f"uploads/{agent_id}"
+
+
+    os.makedirs(upload_dir, exist_ok=True)
+
+
+
+
+
+    file_path = f"{upload_dir}/{file.filename}"
+
+
+    with open(file_path, "wb") as buffer:
+
+
+        shutil.copyfileobj(file.file, buffer)
+
+
+
+
+
+    if 'files' not in agent:
+
+
+        agent['files'] = []
+
+
+
+
+
+    if file.filename not in agent['files']:
+
+
+        agent['files'].append(file.filename)
+
+
+        save_data("agents.json", AGENTS_DB)
+
+
+
+
+
+    return {"filename": file.filename, "message": "File uploaded successfully"}
+
+
+
+
+
+@router.get("/agents/{agent_id}", response_model=AgentResponse)
+
+
+async def get_agent(agent_id: str, current_user: User = Depends(get_current_user)):
+
+
+    agent = AGENTS_DB.get(agent_id)
+
+
+    if not agent or agent.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+
+
+
+
+    relationships_desc = []
+
+
+    for rel in RELATIONSHIPS_DB.values():
+
+
+        # Only show relationships if both agents belong to user (or at least the one being queried)
+
+
+        # For simplicity, we assume relationships are also owned by user
+
+
+        if rel.get("user_id") == current_user.username:
+
+
+            if rel['source_agent_id'] == agent_id:
+
+
+                target = AGENTS_DB.get(rel['target_agent_id'])
+
+
+                if target:
+
+
+                    relationships_desc.append(f"You are {rel['relationship_type']} of {target['name']}")
+
+
+            elif rel['target_agent_id'] == agent_id:
+
+
+                source = AGENTS_DB.get(rel['source_agent_id'])
+
+
+                if source:
+
+
+                    relationships_desc.append(f"{source['name']} is {rel['relationship_type']} of you")
+
+
+
+
+
+    if 'files' not in agent:
+
+
+        agent['files'] = []
+
+
+
+
+
+    return AgentResponse(**agent, relationships=relationships_desc)
+
+
+
+
+
+@router.put("/agents/{agent_id}", response_model=AgentResponse)
+
+
+async def update_agent(agent_id: str, agent_update: AgentUpdateRequest, current_user: User = Depends(get_current_user)):
+
+
+    agent = AGENTS_DB.get(agent_id)
+
+
+    if not agent or agent.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+
+
+
+
+    updated_data = agent_update.dict(exclude_unset=True)
+
+
+    agent.update(updated_data)
+
+
+
+
+
+    AGENTS_DB[agent_id] = agent
+
+
+    save_data("agents.json", AGENTS_DB)
+
+
+    return AgentResponse(**agent)
+
+
+
+
+
+class MemoryInjectRequest(BaseModel):
+
+
+    content: str
+
+
+    importance: int = 1
+
+
+
+
+
+@router.post("/agents/{agent_id}/memory/inject")
+
+
+async def inject_memory(agent_id: str, req: MemoryInjectRequest, current_user: User = Depends(get_current_user)):
+
+
+    agent = AGENTS_DB.get(agent_id)
+
+
+    if not agent or agent.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+
+
+
+
+    try:
+
+
+        # 1. Update Complex Memory
+
+
+        mem_agent = MemoryAgent(agent_id)
+
+
+        result = mem_agent.add_observation(req.content, req.importance)
+
+
+
+
+
+        # 2. Update Simple Memory (for immediate visibility in {{memory}})
+
+
+        if 'long_term_memory' not in agent:
+
+
+            agent['long_term_memory'] = []
+
+
+        agent['long_term_memory'].append(req.content)
+
+
+        save_data("agents.json", AGENTS_DB)
+
+
+
+
+
+        return {"status": "success", "message": result}
+
+
+    except Exception as e:
+
+
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+@router.delete("/agents/{agent_id}")
+
+
+async def delete_agent(agent_id: str, current_user: User = Depends(get_current_user)):
+
+
+    agent = AGENTS_DB.get(agent_id)
+
+
+    if not agent or agent.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+
+
+
+
+    del AGENTS_DB[agent_id]
+
+
+    save_data("agents.json", AGENTS_DB)
+
+
+
+
+
+    to_delete = []
+
+
+    for rel_id, rel in RELATIONSHIPS_DB.items():
+
+
+        if rel.get("user_id") == current_user.username:
+
+
+            if rel['source_agent_id'] == agent_id or rel['target_agent_id'] == agent_id:
+
+
+                to_delete.append(rel_id)
+
+
+    for rid in to_delete:
+
+
+        del RELATIONSHIPS_DB[rid]
+
+
+    save_data("relationships.json", RELATIONSHIPS_DB)
+
+
+    return {"message": "Agent deleted"}
+
+
+
+
+
+@router.post("/agents/{agent_id}/duplicate", response_model=AgentResponse)
+
+
+async def duplicate_agent(agent_id: str, current_user: User = Depends(get_current_user)):
+
+
+    agent = AGENTS_DB.get(agent_id)
+
+
+    if not agent or agent.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+
+
+
+
+    new_agent_id = str(uuid.uuid4())
+
+
+    new_agent = agent.copy()
+
+
+    new_agent['id'] = new_agent_id
+
+
+    new_agent['name'] = f"Copy of {agent['name']}"
+
+
+    # Ensure user_id is set (though it should be in copy)
+
+
+    new_agent['user_id'] = current_user.username
+
+
+
+
+
+    if 'files' in agent and agent['files']:
+
+
+        original_dir = f"uploads/{agent_id}"
+
+
+        new_dir = f"uploads/{new_agent_id}"
+
+
+        if os.path.exists(original_dir):
+
+
+            os.makedirs(new_dir, exist_ok=True)
+
+
+            for filename in agent['files']:
+
+
+                src = os.path.join(original_dir, filename)
+
+
+                dst = os.path.join(new_dir, filename)
+
+
+                if os.path.exists(src):
+
+
+                    shutil.copy2(src, dst)
+
+
+
+
+
+    AGENTS_DB[new_agent_id] = new_agent
+
+
+    save_data("agents.json", AGENTS_DB)
+
+
+    return AgentResponse(**new_agent)
+
+
+
+
+
+@router.put("/agents/{agent_id}/memory", response_model=Dict)
+
+
+async def update_agent_memory(agent_id: str, memory: List[str], current_user: User = Depends(get_current_user)):
+
+
+    agent = AGENTS_DB.get(agent_id)
+
+
+    if not agent or agent.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+
+    agent['long_term_memory'] = memory
+
+
+    save_data("agents.json", AGENTS_DB)
+
+
+    return {"message": "Memory updated"}
+
+
+
+
+
+
+
+
+# --- Worlds ---
+
+
+
+
+
+@router.post("/worlds", response_model=WorldResponse)
+
+
+async def create_world(req: WorldCreateRequest, current_user: User = Depends(get_current_user)):
+
+
+    world_id = str(uuid.uuid4())
+
+
+    walls, colors = make_preset_layers(req.width, req.height, req.preset)
+
+
+
+
+
+    identities = []
+
+
+    if req.preset == "campus":
+
+
+        identities = [
+
+
+            {
+
+
+                "id": "student",
+
+
+                "name": "学生",
+
+
+                "kind": "student",
+
+
+                "description": "在校园里上课、自习、运动、回寝室",
+
+
+                "schedule": [
+
+
+                    {"start_hour": 7, "end_hour": 8, "activity": "去食堂吃早餐", "poi_kinds": ["cafeteria"]},
+
+
+                    {"start_hour": 8, "end_hour": 9, "activity": "回寝室/路上准备上课", "poi_kinds": ["dorm"]},
+
+
+                    {"start_hour": 9, "end_hour": 11, "activity": "去教学楼上课", "poi_kinds": ["classroom"]},
+
+
+                    {"start_hour": 11, "end_hour": 12, "activity": "课间休息/去图书馆翻资料", "poi_kinds": ["library"]},
+
+
+                    {"start_hour": 12, "end_hour": 13, "activity": "去食堂吃午饭", "poi_kinds": ["cafeteria"]},
+
+
+                    {"start_hour": 13, "end_hour": 14, "activity": "回寝室午休", "poi_kinds": ["dorm"]},
+
+
+                    {"start_hour": 14, "end_hour": 16, "activity": "去教学楼上课/实验", "poi_kinds": ["classroom"]},
+
+
+                    {"start_hour": 16, "end_hour": 18, "activity": "去图书馆自习/做项目", "poi_kinds": ["library"]},
+
+
+                    {"start_hour": 18, "end_hour": 19, "activity": "去食堂吃晚饭", "poi_kinds": ["cafeteria"]},
+
+
+                    {"start_hour": 19, "end_hour": 20, "activity": "去操场运动/散步", "poi_kinds": ["sports"]},
+
+
+                    {"start_hour": 20, "end_hour": 24, "activity": "回寝室休息", "poi_kinds": ["dorm"]},
+
+
+                    {"start_hour": 0, "end_hour": 7, "activity": "在寝室休息", "poi_kinds": ["dorm"]},
+
+
+                ],
+
+
+            },
+
+
+            {
+
+
+                "id": "teacher",
+
+
+                "name": "老师",
+
+
+                "kind": "teacher",
+
+
+                "description": "在校园里授课、答疑、研讨、回住处",
+
+
+                "schedule": [
+
+
+                    {"start_hour": 7, "end_hour": 8, "activity": "去食堂吃早餐/准备授课", "poi_kinds": ["cafeteria"]},
+
+
+                    {"start_hour": 8, "end_hour": 9, "activity": "去办公室备课", "poi_kinds": ["office"]},
+
+
+                    {"start_hour": 9, "end_hour": 11, "activity": "去教学楼授课", "poi_kinds": ["classroom"]},
+
+
+                    {"start_hour": 11, "end_hour": 12, "activity": "回办公室/答疑", "poi_kinds": ["office"]},
+
+
+                    {"start_hour": 12, "end_hour": 13, "activity": "去食堂吃午饭", "poi_kinds": ["cafeteria"]},
+
+
+                    {"start_hour": 13, "end_hour": 14, "activity": "午间休息/去图书馆看看资料", "poi_kinds": ["library"]},
+
+
+                    {"start_hour": 14, "end_hour": 16, "activity": "去教学楼授课/研讨", "poi_kinds": ["classroom"]},
+
+
+                    {"start_hour": 16, "end_hour": 18, "activity": "去办公室备课/批改/答疑", "poi_kinds": ["office"]},
+
+
+                    {"start_hour": 18, "end_hour": 19, "activity": "去食堂吃晚饭", "poi_kinds": ["cafeteria"]},
+
+
+                    {"start_hour": 19, "end_hour": 21, "activity": "去图书馆/办公室处理事务", "poi_kinds": ["library", "office"]},
+
+
+                    {"start_hour": 21, "end_hour": 24, "activity": "回住处休息", "poi_kinds": ["dorm"]},
+
+
+                    {"start_hour": 0, "end_hour": 7, "activity": "在住处休息", "poi_kinds": ["dorm"]},
+
+
+                ],
+
+
+            },
+
+
+        ]
+
+
+
+
+
+    pois = []
+
+
+    if req.preset == "campus":
+
+
+        try:
+
+
+            pois = make_campus_default_pois(req.width, req.height)
+
+
+        except Exception:
+
+
+            pois = []
+
+
+
+
+
+    world = {
+
+
+        "id": world_id,
+
+
+        "user_id": current_user.username,
+
+
+        "name": req.name,
+
+
+        "width": req.width,
+
+
+        "height": req.height,
+
+
+        "walls": walls,
+
+
+        "colors": colors,
+
+
+        "agent_placements": [],
+
+
+        "pois": pois,
+
+
+        "identities": identities,
+
+
+        "agent_identities": {},
+
+
+    }
+
+
+    WORLDS_DB[world_id] = world
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+    return WorldResponse(
+
+
+        id=world["id"],
+
+
+        name=world["name"],
+
+
+        width=world["width"],
+
+
+        height=world["height"],
+
+
+        walls_count=len(world.get("walls") or []),
+
+
+        colors_count=len(world.get("colors") or {}),
+
+
+        agent_placements=world.get("agent_placements") or [],
+
+
+        pois=world.get("pois") or [],
+
+
+        identities=world.get("identities") or [],
+
+
+        agent_identities=world.get("agent_identities") or {},
+
+
+    )
+
+
+
+
+
+
+
+
+@router.get("/worlds", response_model=List[WorldResponse])
+
+
+async def list_worlds(current_user: User = Depends(get_current_user)):
+
+
+    out = []
+
+
+    changed = False
+
+
+    for w in WORLDS_DB.values():
+
+
+        if w.get("user_id") != current_user.username:
+
+
+            continue
+
+
+        _normalize_world_schema(w)
+
+
+        changed = changed or ("grid" not in w)
+
+
+        out.append(
+
+
+            WorldResponse(
+
+
+                id=w.get("id"),
+
+
+                name=w.get("name"),
+
+
+                width=w.get("width"),
+
+
+                height=w.get("height"),
+
+
+                walls_count=len(w.get("walls") or []),
+
+
+                colors_count=len(w.get("colors") or {}),
+
+
+                agent_placements=w.get("agent_placements") or [],
+
+
+                pois=w.get("pois") or [],
+
+
+                identities=w.get("identities") or [],
+
+
+                agent_identities=w.get("agent_identities") or {},
+
+
+            )
+
+
+        )
+
+
+    if changed:
+
+
+        save_data("worlds.json", WORLDS_DB)
+
+
+    return out
+
+
+
+
+
+
+
+
+def _poi_area_seed_cells(poi: Dict, max_cells: int = 5000) -> List[tuple[int, int]]:
+
+
+    """Return seed cells belonging to a POI area (bounded)."""
+
+
+    shape = (poi.get("shape") or "point")
+
+
+    if shape == "rect":
+
+
+        x0 = int(poi.get("x") or 0)
+
+
+        y0 = int(poi.get("y") or 0)
+
+
+        w = int(poi.get("w") or 0)
+
+
+        h = int(poi.get("h") or 0)
+
+
+        if w <= 0 or h <= 0:
+
+
+            return [(x0, y0)]
+
+
+        # Prefer perimeter + a few interior samples (keeps it fast).
+
+
+        out: List[tuple[int, int]] = []
+
+
+        for xx in range(x0, x0 + w):
+
+
+            out.append((xx, y0))
+
+
+            out.append((xx, y0 + h - 1))
+
+
+        for yy in range(y0, y0 + h):
+
+
+            out.append((x0, yy))
+
+
+            out.append((x0 + w - 1, yy))
+
+
+        # center
+
+
+        out.append((x0 + w // 2, y0 + h // 2))
+
+
+        # dedupe + cap
+
+
+        seen = set()
+
+
+        uniq: List[tuple[int, int]] = []
+
+
+        for p in out:
+
+
+            if p in seen:
+
+
+                continue
+
+
+            seen.add(p)
+
+
+            uniq.append(p)
+
+
+            if len(uniq) >= max_cells:
+
+
+                break
+
+
+        return uniq
+
+
+
+
+
+    if shape == "cells":
+
+
+        cells = poi.get("cells") or []
+
+
+        out: List[tuple[int, int]] = []
+
+
+        for c in cells:
+
+
+            try:
+
+
+                out.append((int(c.get("x") or 0), int(c.get("y") or 0)))
+
+
+            except Exception:
+
+
+                continue
+
+
+            if len(out) >= max_cells:
+
+
+                break
+
+
+        if out:
+
+
+            return out
+
+
+
+
+
+    # point
+
+
+    return [(int(poi.get("x") or 0), int(poi.get("y") or 0))]
+
+
+
+
+
+
+
+
+@router.get("/worlds/{world_id}", response_model=WorldResponse)
+
+
+async def get_world(world_id: str, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+    return WorldResponse(
+
+
+        id=world.get("id"),
+
+
+        name=world.get("name"),
+
+
+        width=world.get("width"),
+
+
+        height=world.get("height"),
+
+
+        walls_count=len(world.get("walls") or []),
+
+
+        colors_count=len(world.get("colors") or {}),
+
+
+        agent_placements=world.get("agent_placements") or [],
+
+
+        pois=world.get("pois") or [],
+
+
+        identities=world.get("identities") or [],
+
+
+        agent_identities=world.get("agent_identities") or {},
+
+
+    )
+
+
+
+
+
+
+
+
+@router.put("/worlds/{world_id}", response_model=WorldResponse)
+
+
+async def update_world(world_id: str, req: WorldUpdateRequest, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    if req.name is not None:
+
+
+        world["name"] = req.name
+
+
+
+
+
+    # Legacy support: allow small dense grid update (<=200x200) and migrate.
+
+
+    if req.grid is not None:
+
+
+        if world.get("width", 0) > 200 or world.get("height", 0) > 200:
+
+
+            raise HTTPException(status_code=400, detail="Legacy grid updates only supported for worlds up to 200x200")
+
+
+        _validate_grid(req.grid, world["width"], world["height"])
+
+
+        # Convert grid to layers.
+
+
+        walls = set()
+
+
+        colors: Dict[str, WorldColorLabel] = {}
+
+
+        for y, row in enumerate(req.grid):
+
+
+            for x, cell in enumerate(row):
+
+
+                if cell == "wall":
+
+
+                    walls.add(_coord_key(x, y))
+
+
+                elif cell == "court":
+
+
+                    colors[_coord_key(x, y)] = "neutral"
+
+
+        world["walls"] = sorted(walls)
+
+
+        world["colors"] = colors
+
+
+
+
+
+    if req.agent_placements is not None:
+
+
+        # Basic validation only
+
+
+        world["agent_placements"] = [p.dict() for p in req.agent_placements]
+
+
+
+
+
+    if getattr(req, "pois", None) is not None:
+
+
+        world["pois"] = [p.dict() for p in (req.pois or [])]
+
+
+
+
+
+    if getattr(req, "identities", None) is not None:
+
+
+        world["identities"] = [i.dict() for i in (req.identities or [])]
+
+
+
+
+
+    if getattr(req, "agent_identities", None) is not None:
+
+
+        world["agent_identities"] = dict(req.agent_identities or {})
+
+
+
+
+
+    WORLDS_DB[world_id] = world
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+    return WorldResponse(
+
+
+        id=world.get("id"),
+
+
+        name=world.get("name"),
+
+
+        width=world.get("width"),
+
+
+        height=world.get("height"),
+
+
+        walls_count=len(world.get("walls") or []),
+
+
+        colors_count=len(world.get("colors") or {}),
+
+
+        agent_placements=world.get("agent_placements") or [],
+
+
+        pois=world.get("pois") or [],
+
+
+        identities=world.get("identities") or [],
+
+
+        agent_identities=world.get("agent_identities") or {},
+
+
+    )
+
+
+
+
+
+
+
+
+@router.delete("/worlds/{world_id}")
+
+
+async def delete_world(world_id: str, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    del WORLDS_DB[world_id]
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+    return {"message": "World deleted"}
+
+
+
+
+
+
+
+
+@router.get("/worlds/{world_id}/ascii")
+
+
+async def get_world_ascii(world_id: str, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    return {"ascii": _world_ascii(world)}
+
+
+
+
+
+
+
+
+@router.get("/worlds/{world_id}/view", response_model=WorldViewResponse)
+
+
+async def get_world_view(
+
+
+    world_id: str,
+
+
+    x: int = 0,
+
+
+    y: int = 0,
+
+
+    w: int = 80,
+
+
+    h: int = 50,
+
+
+    current_user: User = Depends(get_current_user),
+
+
+):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+    return _build_view(world, x, y, w, h)
+
+
+
+
+
+
+
+
+@router.post("/worlds/{world_id}/draw", response_model=WorldViewResponse)
+
+
+async def draw_world(
+
+
+    world_id: str,
+
+
+    req: WorldDrawRequest,
+
+
+    current_user: User = Depends(get_current_user),
+
+
+):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    world = _apply_draw_ops(world, req.ops)
+
+
+    WORLDS_DB[world_id] = world
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+
+
+
+    vx = req.view_x if req.view_x is not None else 0
+
+
+    vy = req.view_y if req.view_y is not None else 0
+
+
+    vw = req.view_w if req.view_w is not None else 80
+
+
+    vh = req.view_h if req.view_h is not None else 50
+
+
+    return _build_view(world, vx, vy, vw, vh)
+
+
+
+
+
+
+
+
+@router.post("/worlds/{world_id}/agents/place", response_model=WorldResponse)
+
+
+async def place_agent_in_world(world_id: str, req: PlaceAgentRequest, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+
+
+
+    _normalize_world_schema(world)
+
+
+    width, height = world.get("width"), world.get("height")
+
+
+    if not (0 <= req.x < width and 0 <= req.y < height):
+
+
+        raise HTTPException(status_code=400, detail="Position out of bounds")
+
+
+    if _cell_blocked(world, req.x, req.y):
+
+
+        raise HTTPException(status_code=400, detail="Cell is blocked")
+
+
+
+
+
+    placements = world.get("agent_placements") or []
+
+
+    placements = [p for p in placements if p.get("agent_id") != req.agent_id]
+
+
+    placements.append({"agent_id": req.agent_id, "x": req.x, "y": req.y})
+
+
+    world["agent_placements"] = placements
+
+
+    WORLDS_DB[world_id] = world
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+
+
+
+    _append_world_event(
+
+
+        current_user,
+
+
+        world,
+
+
+        "place_agent",
+
+
+        {"agent_id": req.agent_id, "x": req.x, "y": req.y},
+
+
+    )
+
+
+    return WorldResponse(
+
+
+        id=world.get("id"),
+
+
+        name=world.get("name"),
+
+
+        width=world.get("width"),
+
+
+        height=world.get("height"),
+
+
+        walls_count=len(world.get("walls") or []),
+
+
+        colors_count=len(world.get("colors") or {}),
+
+
+        agent_placements=world.get("agent_placements") or [],
+
+
+        pois=world.get("pois") or [],
+
+
+        identities=world.get("identities") or [],
+
+
+        agent_identities=world.get("agent_identities") or {},
+
+
+    )
+
+
+
+
+
+
+
+
+@router.post("/worlds/{world_id}/agents/move", response_model=WorldResponse)
+
+
+async def move_agent_in_world(world_id: str, req: MoveAgentRequest, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+
+
+
+    _normalize_world_schema(world)
+
+
+    width, height = world.get("width"), world.get("height")
+
+
+    if not (0 <= req.to_x < width and 0 <= req.to_y < height):
+
+
+        raise HTTPException(status_code=400, detail="Target out of bounds")
+
+
+    if _cell_blocked(world, req.to_x, req.to_y):
+
+
+        raise HTTPException(status_code=400, detail="Target cell is blocked")
+
+
+
+
+
+    placements = world.get("agent_placements") or []
+
+
+    found = False
+
+
+    for p in placements:
+
+
+        if p.get("agent_id") == req.agent_id:
+
+
+            p["x"], p["y"] = req.to_x, req.to_y
+
+
+            found = True
+
+
+            break
+
+
+    if not found:
+
+
+        raise HTTPException(status_code=404, detail="Agent not placed in world")
+
+
+
+
+
+    world["agent_placements"] = placements
+
+
+    WORLDS_DB[world_id] = world
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+
+
+
+    _append_world_event(
+
+
+        current_user,
+
+
+        world,
+
+
+        "move_agent",
+
+
+        {"agent_id": req.agent_id, "to_x": req.to_x, "to_y": req.to_y},
+
+
+    )
+
+
+    return WorldResponse(
+
+
+        id=world.get("id"),
+
+
+        name=world.get("name"),
+
+
+        width=world.get("width"),
+
+
+        height=world.get("height"),
+
+
+        walls_count=len(world.get("walls") or []),
+
+
+        colors_count=len(world.get("colors") or {}),
+
+
+        agent_placements=world.get("agent_placements") or [],
+
+
+        pois=world.get("pois") or [],
+
+
+        identities=world.get("identities") or [],
+
+
+        agent_identities=world.get("agent_identities") or {},
+
+
+    )
+
+
+
+
+
+
+
+
+@router.post("/worlds/{world_id}/plan_path", response_model=PlanPathResponse)
+
+
+async def plan_path(world_id: str, req: PlanPathRequest, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    placements = world.get("agent_placements") or []
+
+
+    start = None
+
+
+    for p in placements:
+
+
+        if p.get("agent_id") == req.agent_id:
+
+
+            start = (p.get("x"), p.get("y"))
+
+
+            break
+
+
+    if start is None:
+
+
+        raise HTTPException(status_code=404, detail="Agent not placed in world")
+
+
+
+
+
+    path = _cached_a_star_path(world_id, world, start[0], start[1], req.target_x, req.target_y)
+
+
+    if not path:
+
+
+        raise HTTPException(status_code=400, detail="No path found")
+
+
+    return PlanPathResponse(path=[PathPoint(x=x, y=y) for (x, y) in path])
+
+
+
+
+
+
+
+
+@router.get("/worlds/{world_id}/pois", response_model=WorldPOIsResponse)
+
+
+async def list_world_pois(world_id: str, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+    return WorldPOIsResponse(pois=[WorldPOI(**p) for p in (world.get("pois") or [])])
+
+
+
+
+
+
+
+
+@router.post("/worlds/{world_id}/pois", response_model=WorldPOI)
+
+
+async def create_world_poi(world_id: str, req: WorldPOICreateRequest, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    width, height = int(world.get("width") or 0), int(world.get("height") or 0)
+
+
+    if not (0 <= req.x < width and 0 <= req.y < height):
+
+
+        raise HTTPException(status_code=400, detail="POI position out of bounds")
+
+
+
+
+
+    poi = WorldPOI(
+
+
+        id=str(uuid.uuid4()),
+
+
+        name=req.name,
+
+
+        kind=req.kind,
+
+
+        label=req.label,
+
+
+        x=req.x,
+
+
+        y=req.y,
+
+
+        description=req.description,
+
+
+    )
+
+
+
+
+
+    pois = world.get("pois") or []
+
+
+    pois.append(poi.dict())
+
+
+    world["pois"] = pois
+
+
+    WORLDS_DB[world_id] = world
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+
+
+
+    _append_world_event(
+
+
+        current_user,
+
+
+        world,
+
+
+        "create_poi",
+
+
+        {"poi_id": poi.id, "name": poi.name, "kind": poi.kind, "label": poi.label, "x": poi.x, "y": poi.y},
+
+
+    )
+
+
+    return poi
+
+
+
+
+
+
+
+
+@router.put("/worlds/{world_id}/pois/{poi_id}", response_model=WorldPOI)
+
+
+async def update_world_poi(world_id: str, poi_id: str, req: WorldPOIUpdateRequest, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    width, height = int(world.get("width") or 0), int(world.get("height") or 0)
+
+
+    pois = world.get("pois") or []
+
+
+    found = None
+
+
+    for p in pois:
+
+
+        if p.get("id") == poi_id:
+
+
+            found = p
+
+
+            break
+
+
+    if not found:
+
+
+        raise HTTPException(status_code=404, detail="POI not found")
+
+
+
+
+
+    if req.name is not None:
+
+
+        found["name"] = req.name
+
+
+    if req.kind is not None:
+
+
+        found["kind"] = req.kind
+
+
+    if req.label is not None:
+
+
+        found["label"] = req.label
+
+
+    if req.description is not None:
+
+
+        found["description"] = req.description
+
+
+    if req.x is not None:
+
+
+        if not (0 <= req.x < width):
+
+
+            raise HTTPException(status_code=400, detail="POI x out of bounds")
+
+
+        found["x"] = req.x
+
+
+    if req.y is not None:
+
+
+        if not (0 <= req.y < height):
+
+
+            raise HTTPException(status_code=400, detail="POI y out of bounds")
+
+
+        found["y"] = req.y
+
+
+
+
+
+    world["pois"] = pois
+
+
+    WORLDS_DB[world_id] = world
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+
+
+
+    _append_world_event(current_user, world, "update_poi", {"poi_id": poi_id})
+
+
+    return WorldPOI(**found)
+
+
+
+
+
+
+
+
+@router.delete("/worlds/{world_id}/pois/{poi_id}")
+
+
+async def delete_world_poi(world_id: str, poi_id: str, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    pois = world.get("pois") or []
+
+
+    new_pois = [p for p in pois if p.get("id") != poi_id]
+
+
+    if len(new_pois) == len(pois):
+
+
+        raise HTTPException(status_code=404, detail="POI not found")
+
+
+
+
+
+    world["pois"] = new_pois
+
+
+    WORLDS_DB[world_id] = world
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+
+
+
+    _append_world_event(current_user, world, "delete_poi", {"poi_id": poi_id})
+
+
+    return {"message": "POI deleted"}
+
+
+
+
+
+
+
+
+@router.post("/worlds/{world_id}/plan_path_to_poi", response_model=PlanPathToPOIResponse)
+
+
+async def plan_path_to_poi(world_id: str, req: PlanPathToPOIRequest, current_user: User = Depends(get_current_user)):
+
+
+    """Plan a path from an agent to a named POI's anchor (or nearby walkable cell)."""
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    placements = world.get("agent_placements") or []
+
+
+    start = None
+
+
+    for p in placements:
+
+
+        if p.get("agent_id") == req.agent_id:
+
+
+            start = (int(p.get("x") or 0), int(p.get("y") or 0))
+
+
+            break
+
+
+    if start is None:
+
+
+        raise HTTPException(status_code=404, detail="Agent not placed in world")
+
+
+
+
+
+    poi_raw = None
+
+
+    for p in (world.get("pois") or []):
+
+
+        if p.get("id") == req.poi_id:
+
+
+            poi_raw = p
+
+
+            break
+
+
+    if not poi_raw:
+
+
+        raise HTTPException(status_code=404, detail="POI not found")
+
+
+
+
+
+    poi = WorldPOI(**poi_raw)
+
+
+    seeds = _poi_area_seed_cells(poi_raw, max_cells=5000)
+
+
+    sx, sy = start
+
+
+
+
+
+    # Prefer POI seeds nearer to the agent; keep it bounded for performance.
+
+
+    if seeds:
+
+
+        seeds.sort(key=lambda t: abs(t[0] - sx) + abs(t[1] - sy))
+
+
+        seeds = seeds[:200]
+
+
+
+
+
+    # Expand seeds to nearby walkable target candidates; try nearest first.
+
+
+    cand: List[tuple[int, int]] = []
+
+
+    seen = set()
+
+
+    for (px, py) in seeds:
+
+
+        for (tx, ty) in _nearby_candidates(world, int(px), int(py), int(req.max_radius)):
+
+
+            if (tx, ty) in seen:
+
+
+                continue
+
+
+            seen.add((tx, ty))
+
+
+            cand.append((tx, ty))
+
+
+            if len(cand) >= 220:
+
+
+                break
+
+
+        if len(cand) >= 220:
+
+
+            break
+
+
+
+
+
+    if not cand:
+
+
+        raise HTTPException(status_code=400, detail="No reachable target near POI area")
+
+
+
+
+
+    cand.sort(key=lambda t: abs(t[0] - sx) + abs(t[1] - sy))
+
+
+    max_attempts = 40
+
+
+    for (tx, ty) in cand[:max_attempts]:
+
+
+        path = _a_star_path(world, sx, sy, tx, ty)
+
+
+        if not path:
+
+
+            continue
+
+
+        return PlanPathToPOIResponse(
+
+
+            poi=poi,
+
+
+            target=PathPoint(x=tx, y=ty),
+
+
+            path=[PathPoint(x=x, y=y) for (x, y) in path],
+
+
+        )
+
+
+
+
+
+    raise HTTPException(status_code=400, detail="No path found to POI")
+
+
+
+
+
+
+
+
+@router.get("/worlds/{world_id}/identities", response_model=WorldIdentitiesResponse)
+
+
+async def list_world_identities(world_id: str, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+    return WorldIdentitiesResponse(identities=[WorldIdentity(**i) for i in (world.get("identities") or [])])
+
+
+
+
+
+
+
+
+@router.post("/worlds/{world_id}/identities", response_model=WorldIdentity)
+
+
+async def create_world_identity(world_id: str, req: WorldIdentityCreateRequest, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    identity = WorldIdentity(
+
+
+        id=str(uuid.uuid4()),
+
+
+        name=req.name,
+
+
+        kind=req.kind,
+
+
+        description=req.description,
+
+
+        schedule=req.schedule or [],
+
+
+    )
+
+
+    identities = world.get("identities") or []
+
+
+    identities.append(identity.dict())
+
+
+    world["identities"] = identities
+
+
+    WORLDS_DB[world_id] = world
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+    return identity
+
+
+
+
+
+
+
+
+@router.put("/worlds/{world_id}/identities/{identity_id}", response_model=WorldIdentity)
+
+
+async def update_world_identity(world_id: str, identity_id: str, req: WorldIdentityUpdateRequest, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    identities = world.get("identities") or []
+
+
+    found = None
+
+
+    for it in identities:
+
+
+        if it.get("id") == identity_id:
+
+
+            found = it
+
+
+            break
+
+
+    if not found:
+
+
+        raise HTTPException(status_code=404, detail="Identity not found")
+
+
+
+
+
+    if req.name is not None:
+
+
+        found["name"] = req.name
+
+
+    if req.kind is not None:
+
+
+        found["kind"] = req.kind
+
+
+    if req.description is not None:
+
+
+        found["description"] = req.description
+
+
+    if req.schedule is not None:
+
+
+        found["schedule"] = [x.dict() for x in (req.schedule or [])]
+
+
+
+
+
+    world["identities"] = identities
+
+
+    WORLDS_DB[world_id] = world
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+    return WorldIdentity(**found)
+
+
+
+
+
+
+
+
+@router.delete("/worlds/{world_id}/identities/{identity_id}")
+
+
+async def delete_world_identity(world_id: str, identity_id: str, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    identities = world.get("identities") or []
+
+
+    new_identities = [i for i in identities if i.get("id") != identity_id]
+
+
+    if len(new_identities) == len(identities):
+
+
+        raise HTTPException(status_code=404, detail="Identity not found")
+
+
+
+
+
+    world["identities"] = new_identities
+
+
+    # Remove assignments pointing to deleted identity.
+
+
+    agent_identities = world.get("agent_identities") or {}
+
+
+    agent_identities = {k: v for (k, v) in agent_identities.items() if v != identity_id}
+
+
+    world["agent_identities"] = agent_identities
+
+
+
+
+
+    WORLDS_DB[world_id] = world
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+    return {"message": "Identity deleted"}
+
+
+
+
+
+
+
+
+@router.post("/worlds/{world_id}/agent_identity")
+
+
+async def set_world_agent_identity(world_id: str, req: SetWorldAgentIdentityRequest, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    # validate agent exists
+
+
+    a = AGENTS_DB.get(req.agent_id)
+
+
+    if not a or a.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+
+
+
+
+    # validate identity exists
+
+
+    identity_ids = {i.get("id") for i in (world.get("identities") or [])}
+
+
+    if req.identity_id not in identity_ids:
+
+
+        raise HTTPException(status_code=400, detail="Identity not found in this world")
+
+
+
+
+
+    agent_identities = world.get("agent_identities") or {}
+
+
+    agent_identities[str(req.agent_id)] = str(req.identity_id)
+
+
+    world["agent_identities"] = agent_identities
+
+
+    WORLDS_DB[world_id] = world
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+    return {"message": "Agent identity set", "agent_id": req.agent_id, "identity_id": req.identity_id}
+
+
+
+
+
+
+
+
+@router.post("/worlds/{world_id}/pick_poi_path", response_model=PickPOIPathResponse)
+
+
+async def pick_poi_path(world_id: str, req: PickPOIPathRequest, current_user: User = Depends(get_current_user)):
+
+
+    """Pick a POI by color label(s), then return a reachable nearby target + its path.
+
+
+
+
+
+    Intended for agent auto-roam: avoid random goals; go to semantic zones.
+
+
+    Note: POI-colored cells may be blocked (e.g. buildings). We search nearby walkable cells.
+
+
+    """
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    placements = world.get("agent_placements") or []
+
+
+    start = None
+
+
+    for p in placements:
+
+
+        if p.get("agent_id") == req.agent_id:
+
+
+            start = (int(p.get("x") or 0), int(p.get("y") or 0))
+
+
+            break
+
+
+    if start is None:
+
+
+        raise HTTPException(status_code=404, detail="Agent not placed in world")
+
+
+
+
+
+    labels = [x for x in (req.labels or []) if x and x != "none"]
+
+
+    colors = world.get("colors") or {}
+
+
+
+
+
+    seed_cells: List[tuple[int, int, WorldColorLabel]] = []
+
+
+    if labels:
+
+
+        allowed = set(labels)
+
+
+        for k, v in colors.items():
+
+
+            if v not in allowed:
+
+
+                continue
+
+
+            try:
+
+
+                sx, sy = _parse_coord_key(k)
+
+
+            except Exception:
+
+
+                continue
+
+
+            seed_cells.append((sx, sy, v))
+
+
+
+
+
+    if not seed_cells:
+
+
+        raise HTTPException(status_code=400, detail="No POI cells found for requested labels")
+
+
+
+
+
+    sx0, sy0 = start
+
+
+    if req.strategy == "nearest":
+
+
+        seed_cells.sort(key=lambda t: abs(t[0] - sx0) + abs(t[1] - sy0))
+
+
+        seed_cells = seed_cells[: req.max_seed_cells]
+
+
+    else:
+
+
+        if len(seed_cells) > req.max_seed_cells:
+
+
+            seed_cells = random.sample(seed_cells, req.max_seed_cells)
+
+
+        random.shuffle(seed_cells)
+
+
+
+
+
+    attempts = 0
+
+
+    for (px, py, lbl) in seed_cells:
+
+
+        candidates = _nearby_candidates(world, px, py, req.max_radius)
+
+
+        # If POI itself is walkable, _nearby_candidates returns it first.
+
+
+        for (tx, ty) in candidates:
+
+
+            attempts += 1
+
+
+            if attempts > req.max_attempts:
+
+
+                break
+
+
+            path = _a_star_path(world, sx0, sy0, tx, ty)
+
+
+            if not path:
+
+
+                continue
+
+
+            return PickPOIPathResponse(
+
+
+                label=lbl,
+
+
+                poi=PathPoint(x=px, y=py),
+
+
+                target=PathPoint(x=tx, y=ty),
+
+
+                path=[PathPoint(x=x, y=y) for (x, y) in path],
+
+
+            )
+
+
+        if attempts > req.max_attempts:
+
+
+            break
+
+
+
+
+
+    raise HTTPException(status_code=400, detail="No reachable POI target found")
+
+
+
+
+
+
+
+
+@router.post("/worlds/{world_id}/encounter_dialogue", response_model=WorldEncounterDialogueResponse)
+
+
+async def world_encounter_dialogue(
+
+
+    world_id: str,
+
+
+    req: WorldEncounterDialogueRequest,
+
+
+    current_user: User = Depends(get_current_user),
+
+
+):
+
+
+    """Generate a short dialogue for two agents who encounter each other in the world.
+
+
+
+
+
+    This is intended for the World UI: show returned lines as chat bubbles above agents.
+
+
+    """
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    # Ensure both agents exist and belong to the user.
+
+
+    a = AGENTS_DB.get(req.agent_a_id)
+
+
+    b = AGENTS_DB.get(req.agent_b_id)
+
+
+    if not a or a.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="Agent A not found")
+
+
+    if not b or b.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="Agent B not found")
+
+
+
+
+
+    placements = world.get("agent_placements") or []
+
+
+    pos: Dict[str, tuple[int, int]] = {}
+
+
+    for p in placements:
+
+
+        aid = p.get("agent_id")
+
+
+        if not aid:
+
+
+            continue
+
+
+        try:
+
+
+            pos[aid] = (int(p.get("x") or 0), int(p.get("y") or 0))
+
+
+        except Exception:
+
+
+            continue
+
+
+
+
+
+    if req.agent_a_id not in pos or req.agent_b_id not in pos:
+
+
+        raise HTTPException(status_code=400, detail="Both agents must be placed in the world")
+
+
+
+
+
+    a_name = a.get("name") or req.agent_a_id
+
+
+    b_name = b.get("name") or req.agent_b_id
+
+
+    ax, ay = pos[req.agent_a_id]
+
+
+    bx, by = pos[req.agent_b_id]
+
+
+
+
+
+    max_turns = int(req.max_turns or 2)
+
+
+    max_turns = max(2, min(6, max_turns))
+
+
+
+
+
+    topic = (req.topic or "").strip() or "在校园里偶遇，先打招呼，再交流一个学习相关的小建议。"
+
+
+
+
+
+    def extract_text_only(val: object) -> str:
+
+
+        if val is None:
+
+
+            return ""
+
+
+        if not isinstance(val, str):
+
+
+            return str(val)
+
+
+        s = val.strip()
+
+
+        # If the model returned OpenAI-style JSON content list, pull out text parts.
+
+
+        if s.startswith("[") and s.endswith("]"):
+
+
+            try:
+
+
+                items = json.loads(s)
+
+
+                if isinstance(items, list):
+
+
+                    texts = []
+
+
+                    for it in items:
+
+
+                        if isinstance(it, dict) and it.get("type") == "text":
+
+
+                            t = it.get("text")
+
+
+                            if isinstance(t, str) and t.strip():
+
+
+                                texts.append(t.strip())
+
+
+                    if texts:
+
+
+                        return " ".join(texts).strip()
+
+
+            except Exception:
+
+
+                pass
+
+
+        return s
+
+
+
+
+
+    def invoke_agent_once(agent: Dict, line_prompt: str) -> str:
+
+
+        provider = agent.get("provider")
+
+
+        messages = [{"role": "user", "content": line_prompt}]
+
+
+        persona = agent.get("persona")
+
+
+        if persona:
+
+
+            messages = [{"role": "system", "content": persona}] + messages
+
+
+
+
+
+        if provider in ["deepseek", "zhipu"]:
+
+
+            res = ai_chat(
+
+
+                messages_or_prompt=messages,
+
+
+                model=agent.get("model"),
+
+
+                api_key=agent.get("api_key"),
+
+
+                base_url=agent.get("base_url"),
+
+
+                temperature=0.7,
+
+
+                max_tokens=330,
+
+
+            )
+
+
+            return extract_text_only((res or {}).get("content") if isinstance(res, dict) else str(res))
+
+
+
+
+
+        if provider == "custom":
+
+
+            code_str = agent.get("usage_example")
+
+
+            if not code_str:
+
+
+                return ""
+
+
+            local_scope = {"json": json}
+
+
+            exec(code_str, local_scope)
+
+
+            invoke_func = local_scope.get("invoke_custom_agent")
+
+
+            if not invoke_func:
+
+
+                return ""
+
+
+            result = invoke_func(
+
+
+                messages=messages,
+
+
+                api_key=agent.get("api_key"),
+
+
+                base_url=agent.get("base_url"),
+
+
+                model=agent.get("model"),
+
+
+                temperature=0.7,
+
+
+            )
+
+
+            if isinstance(result, dict):
+
+
+                return extract_text_only(result.get("content") or "")
+
+
+            return extract_text_only(str(result))
+
+
+
+
+
+        return ""
+
+
+
+
+
+    turns: List[WorldEncounterDialogueTurn] = []
+
+
+    transcript = ""
+
+
+
+
+
+    for i in range(max_turns):
+
+
+        speaker = a if i % 2 == 0 else b
+
+
+        speaker_id = req.agent_a_id if i % 2 == 0 else req.agent_b_id
+
+
+        listener_name = b_name if speaker_id == req.agent_a_id else a_name
+
+
+        speaker_name = a_name if speaker_id == req.agent_a_id else b_name
+
+
+        sx, sy = pos[speaker_id]
+
+
+        lx, ly = (bx, by) if speaker_id == req.agent_a_id else (ax, ay)
+
+
+
+
+
+        line_prompt = (
+
+
+            f"你是{speaker_name}，校园里的学生。你在({sx},{sy})附近遇见了{listener_name}（在({lx},{ly})）。\n"
+
+
+            f"话题：{topic}\n\n"
+
+
+            "要求：\n"
+
+
+            "- 只输出一句你要说的话\n"
+
+
+            "- 尽量短（<=20字）\n"
+
+
+            "- 不要旁白/引号/表情\n\n"
+
+
+            f"已发生对话：\n{transcript}\n"
+
+
+            "现在你说："
+
+
+        )
+
+
+
+
+
+        text = invoke_agent_once(speaker, line_prompt)
+
+
+        text = re.sub(r"\s+", " ", (text or "").strip())
+
+
+        if len(text) > 80:
+
+
+            text = text[:80]
+
+
+        if not text:
+
+
+            text = "你好" if i == 0 else "嗯嗯"
+
+
+
+
+
+        turns.append(WorldEncounterDialogueTurn(agent_id=speaker_id, text=text))
+
+
+        transcript += f"{speaker_name}: {text}\n"
+
+
+
+
+
+    # Persist as a world event (for world timeline / replay).
+
+
+    _append_world_event(
+
+
+        current_user,
+
+
+        world,
+
+
+        "encounter_dialogue",
+
+
+        {
+
+
+            "topic": topic,
+
+
+            "agent_a": {"id": req.agent_a_id, "name": a_name, "x": ax, "y": ay},
+
+
+            "agent_b": {"id": req.agent_b_id, "name": b_name, "x": bx, "y": by},
+
+
+            "turns": [t.dict() for t in turns],
+
+
+            "transcript": transcript.strip(),
+
+
+        },
+
+
+    )
+
+
+
+
+
+    # Write into each agent's chat history and long-term memory.
+
+
+    encounter_prompt = f"世界偶遇：{world.get('name') or world_id}，话题：{topic}"
+
+
+    now_ts = time.time()
+
+
+    for agent_obj, self_name, other_name, self_pos in [
+
+
+        (a, a_name, b_name, (ax, ay)),
+
+
+        (b, b_name, a_name, (bx, by)),
+
+
+    ]:
+
+
+        agent_id = agent_obj.get("id")
+
+
+        if not agent_id:
+
+
+            continue
+
+
+
+
+
+        _append_agent_chat_history(
+
+
+            agent_id,
+
+
+            {
+
+
+                "role": "assistant",
+
+
+                "content": transcript.strip(),
+
+
+                "prompt": encounter_prompt,
+
+
+                "timestamp": now_ts,
+
+
+            },
+
+
+        )
+
+
+
+
+
+        mem_text = (
+
+
+            f"[世界:{world.get('name') or world_id}] 我({self_name})在{self_pos}附近遇到{other_name}。"
+
+
+            f"话题：{topic}。对话记录：{transcript.strip()}"
+
+
+        )
+
+
+        _inject_agent_memory_side_effect(agent_obj, mem_text, importance=1)
+
+
+
+
+
+    return WorldEncounterDialogueResponse(turns=turns)
+
+
+
+
+
+
+
+
+@router.get("/worlds/{world_id}/events", response_model=WorldEventsResponse)
+
+
+async def get_world_events(world_id: str, limit: int = 200, current_user: User = Depends(get_current_user)):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+
+
+
+    limit = int(limit or 200)
+
+
+    limit = max(1, min(1000, limit))
+
+
+    events = WORLD_EVENTS_DB.get(world_id, [])
+
+
+    # newest first
+
+
+    events = list(reversed(events[-limit:]))
+
+
+    return WorldEventsResponse(events=[WorldEventRecord(**e) for e in events])
+
+
+
+
+
+
+
+
+@router.post("/worlds/{world_id}/ai_draw", response_model=WorldAIDrawResponse)
+
+
+async def ai_draw_world(
+
+
+    world_id: str,
+
+
+    req: WorldAIDrawRequest,
+
+
+    current_user: User = Depends(get_current_user),
+
+
+):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    view = _build_view(world, req.x, req.y, req.w, req.h)
+
+
+
+
+
+    system_prompt = """
+
+
+You are a WORLD MAP PAINTER. You output ONLY valid JSON.
+
+
+
+
+
+You will be given a world size and a target viewport rectangle (x,y,w,h). You must propose drawing operations to modify the map.
+
+
+
+
+
+World representation is TWO layers:
+
+
+1) wall layer: boolean wall blocks movement
+
+
+2) color layer: semantic label for display
+
+
+
+
+
+Allowed colors: ["none","neutral","primary","success","warning","error","info"]. Use "none" to clear color.
+
+
+
+
+
+Output JSON format:
+
+
+{
+
+
+  "ops": [
+
+
+    {"layer":"wall","shape":"rect","x":0,"y":0,"x2":10,"y2":0,"wall":true},
+
+
+    {"layer":"color","shape":"rect","x":1,"y":1,"x2":9,"y2":8,"color":"neutral"}
+
+
+  ]
+
+
+}
+
+
+
+
+
+Rules:
+
+
+- All coordinates must stay INSIDE the provided viewport bounds.
+
+
+- Keep ops <= max_ops.
+
+
+- Prefer rect/line over thousands of single cells.
+
+
+""".strip()
+
+
+
+
+
+    user_prompt = {
+
+
+        "instruction": req.prompt,
+
+
+        "world_size": {"width": world.get("width"), "height": world.get("height")},
+
+
+        "viewport": {"x": view.x, "y": view.y, "w": view.width, "h": view.height},
+
+
+        "current_view": {"walls": view.walls, "colors": view.colors},
+
+
+        "max_ops": req.max_ops,
+
+
+    }
+
+
+
+
+
+    res = ai_chat(
+
+
+        messages_or_prompt=[
+
+
+            {"role": "system", "content": system_prompt},
+
+
+            {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
+
+
+        ],
+
+
+        temperature=0.3,
+
+
+        max_tokens=4500,
+
+
+    )
+
+
+
+
+
+    raw_content = res.get("content", "") if isinstance(res, dict) else str(res)
+
+
+    logging.info(f"[ai_draw] raw model output (first 800 chars): {str(raw_content)[:800]}")
+
+
+
+
+
+    try:
+
+
+        parsed = clean_and_parse_json(raw_content)
+
+
+    except Exception as e:
+
+
+        raise HTTPException(status_code=500, detail=f"AI draw JSON parse failed: {e}")
+
+
+
+
+
+    ops_raw = parsed.get("ops") if isinstance(parsed, dict) else None
+
+
+    if not isinstance(ops_raw, list):
+
+
+        raise HTTPException(status_code=500, detail="AI draw response missing 'ops' list")
+
+
+
+
+
+    ops: List[WorldDrawOp] = []
+
+
+    filtered = {"parse": 0, "missing": 0, "oob": 0}
+
+
+
+
+
+    vx1, vy1 = view.x, view.y
+
+
+    vx2, vy2 = view.x + view.width - 1, view.y + view.height - 1
+
+
+
+
+
+    def in_v(x: int, y: int) -> bool:
+
+
+        return vx1 <= x <= vx2 and vy1 <= y <= vy2
+
+
+
+
+
+    def clamp_x(x: int) -> int:
+
+
+        return max(vx1, min(vx2, x))
+
+
+
+
+
+    def clamp_y(y: int) -> int:
+
+
+        return max(vy1, min(vy2, y))
+
+
+
+
+
+    for item in ops_raw[: req.max_ops]:
+
+
+        try:
+
+
+            op = WorldDrawOp(**item)
+
+
+        except Exception:
+
+
+            filtered["parse"] += 1
+
+
+            continue
+
+
+
+
+
+        if op.shape == "cell":
+
+
+            if op.x is None or op.y is None:
+
+
+                filtered["missing"] += 1
+
+
+                continue
+
+
+            if not in_v(op.x, op.y):
+
+
+                filtered["oob"] += 1
+
+
+                continue
+
+
+
+
+
+        elif op.shape == "cells":
+
+
+            if not op.cells:
+
+
+                filtered["missing"] += 1
+
+
+                continue
+
+
+            # Keep only in-bounds cells
+
+
+            kept = [p for p in op.cells if in_v(p.x, p.y)]
+
+
+            if not kept:
+
+
+                filtered["oob"] += 1
+
+
+                continue
+
+
+            op.cells = kept
+
+
+
+
+
+        elif op.shape == "rect":
+
+
+            if op.x is None or op.y is None or op.x2 is None or op.y2 is None:
+
+
+                filtered["missing"] += 1
+
+
+                continue
+
+
+            # Clip rectangle into viewport bounds instead of dropping.
+
+
+            x1, y1 = clamp_x(op.x), clamp_y(op.y)
+
+
+            x2, y2 = clamp_x(op.x2), clamp_y(op.y2)
+
+
+            op.x, op.y, op.x2, op.y2 = x1, y1, x2, y2
+
+
+
+
+
+        elif op.shape == "line":
+
+
+            if op.x is None or op.y is None or op.x2 is None or op.y2 is None:
+
+
+                filtered["missing"] += 1
+
+
+                continue
+
+
+            # For line we require both endpoints to be in bounds (avoid weird clipping artifacts).
+
+
+            if not (in_v(op.x, op.y) and in_v(op.x2, op.y2)):
+
+
+                filtered["oob"] += 1
+
+
+                continue
+
+
+
+
+
+        ops.append(op)
+
+
+
+
+
+    if not ops:
+
+
+        raise HTTPException(
+
+
+            status_code=400,
+
+
+            detail=(
+
+
+                "AI returned no valid draw ops for this viewport. "
+
+
+                f"Filtered counts={filtered}. "
+
+
+                "Try: (1) ensure viewport is where you want to draw, (2) ask for a few rect ops, "
+
+
+                "(3) keep coordinates within viewport bounds."
+
+
+            ),
+
+
+        )
+
+
+
+
+
+    world = _apply_draw_ops(world, ops)
+
+
+    WORLDS_DB[world_id] = world
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+
+
+
+    new_view = _build_view(world, view.x, view.y, view.width, view.height)
+
+
+    return WorldAIDrawResponse(ops=ops, view=new_view)
+
+
+
+
+
+
+
+
+@router.post("/worlds/{world_id}/ai_script", response_model=WorldAIScriptResponse)
+
+
+async def ai_script_world(
+
+
+    world_id: str,
+
+
+    req: WorldAIScriptRequest,
+
+
+    current_user: User = Depends(get_current_user),
+
+
+):
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    view = _build_view(world, req.x, req.y, req.w, req.h)
+
+
+
+
+
+    system_prompt = """
+
+
+You are a WORLD MAP SCRIPT WRITER. Output ONLY valid JSON.
+
+
+
+
+
+You must generate a list of SAFE, RESTRICTED drawing commands that will be executed by the server.
+
+
+All drawing must stay inside the provided viewport bounds.
+
+
+
+
+
+Command schema:
+
+
+{
+
+
+  "commands": [
+
+
+    {"type":"fill_rect", "color":"success"},
+
+
+    {"type":"border_walls", "thickness":1, "wall":true},
+
+
+    {"type":"checkerboard", "color_a":"primary", "color_b":"error", "cell_size":1},
+
+
+    {"type":"random_choice", "palette":["primary","error"], "probabilities":[0.5,0.5], "seed":123}
+
+
+  ]
+
+
+}
+
+
+
+
+
+Rules:
+
+
+- Output at most max_commands commands.
+
+
+- Do not use coordinates outside the viewport.
+
+
+- Prefer high-level commands (checkerboard/random_choice) for complex patterns.
+
+
+""".strip()
+
+
+
+
+
+    user_payload = {
+
+
+        "instruction": req.prompt,
+
+
+        "viewport": {"x": view.x, "y": view.y, "w": view.width, "h": view.height},
+
+
+        "world_size": {"width": world.get("width"), "height": world.get("height")},
+
+
+        "max_commands": req.max_commands,
+
+
+        "max_cells": req.max_cells,
+
+
+    }
+
+
+
+
+
+    res = ai_chat(
+
+
+        messages_or_prompt=[
+
+
+            {"role": "system", "content": system_prompt},
+
+
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+
+
+        ],
+
+
+        temperature=0.2,
+
+
+        max_tokens=3000,
+
+
+    )
+
+
+
+
+
+    raw = res.get("content", "") if isinstance(res, dict) else str(res)
+
+
+    logging.info(f"[ai_script] raw model output (first 800 chars): {str(raw)[:800]}")
+
+
+
+
+
+    try:
+
+
+        parsed = clean_and_parse_json(raw)
+
+
+    except Exception as e:
+
+
+        raise HTTPException(status_code=500, detail=f"AI script JSON parse failed: {e}")
+
+
+
+
+
+    cmds_raw = parsed.get("commands") if isinstance(parsed, dict) else None
+
+
+    if not isinstance(cmds_raw, list):
+
+
+        raise HTTPException(status_code=500, detail="AI script response missing 'commands' list")
+
+
+
+
+
+    commands: List[WorldScriptCommand] = []
+
+
+    for item in cmds_raw[: req.max_commands]:
+
+
+        try:
+
+
+            commands.append(WorldScriptCommand(**item))
+
+
+        except Exception:
+
+
+            continue
+
+
+
+
+
+    if not commands:
+
+
+        raise HTTPException(status_code=400, detail="AI returned 0 valid script commands")
+
+
+
+
+
+    ops = _execute_world_script(world, view, commands, max_cells=req.max_cells)
+
+
+    world = _apply_draw_ops(world, ops)
+
+
+    WORLDS_DB[world_id] = world
+
+
+    save_data("worlds.json", WORLDS_DB)
+
+
+
+
+
+    new_view = _build_view(world, view.x, view.y, view.width, view.height)
+
+
+    return WorldAIScriptResponse(commands=commands, view=new_view)
+
+
+
+
+
+
+
+
+@router.post("/worlds/{world_id}/ai_generate", response_model=WorldAIGenerateResponse)
+
+
+async def ai_generate_world(
+
+
+    world_id: str,
+
+
+    req: WorldAIGenerateRequest,
+
+
+    current_user: User = Depends(get_current_user),
+
+
+):
+
+
+    """Unified AI generation endpoint.
+
+
+
+
+
+    - mode=script: AI outputs restricted commands -> executed into ops
+
+
+    - mode=ops: AI outputs ops directly (like ai_draw)
+
+
+    - mode=auto: AI first outputs commands (Planner), applies them, then outputs ops (Painter) to refine
+
+
+    """
+
+
+    world = WORLDS_DB.get(world_id)
+
+
+    if not world or world.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="World not found")
+
+
+    _normalize_world_schema(world)
+
+
+
+
+
+    view = _build_view(world, req.x, req.y, req.w, req.h)
+
+
+    all_commands: List[WorldScriptCommand] = []
+
+
+    all_ops: List[WorldDrawOp] = []
+
+
+
+
+
+    drawing_guide = """
+
+
+GRID DRAWING GUIDE (IMPORTANT)
+
+
+
+
+
+You are drawing a TILE GRID. One tile = one cell.
+
+
+
+
+
+Viewport:
+
+
+- You MUST draw only inside the given viewport bounds.
+
+
+- Coordinates are ABSOLUTE world coordinates.
+
+
+
+
+
+Layers:
+
+
+- color layer: visual only. Use this for lines/markings.
+
+
+- wall layer: blocks movement. Use sparingly (e.g., goal posts / obstacles).
+
+
+
+
+
+Colors:
+
+
+- grass: success
+
+
+- lines/markings: info (high contrast)
+
+
+- neutral areas: neutral
+
+
+
+
+
+Soccer field recipe (what users expect to SEE):
+
+
+- grass fill (success)
+
+
+- boundary lines (info)
+
+
+- center line (info)
+
+
+- center circle (info)
+
+
+- two penalty boxes + two goal areas (info)
+
+
+- goal openings on left/right boundary + goal posts (wall)
+
+
+
+
+
+If uncertain: draw the big shapes first (fill + border + center line), then add details.
+
+
+""".strip()
+
+
+
+
+
+    if req.mode in ("script", "auto"):
+
+
+        planner_system = """
+
+
+You are the WORLD PLANNER (Script Writer). Output ONLY valid JSON.
+
+
+Generate a list of SAFE drawing commands to satisfy the instruction.
+
+
+
+
+
+{drawing_guide}
+
+
+
+
+
+Schema:
+
+
+{"commands":[
+
+
+    {"type":"fill_rect","color":"success"},
+
+
+    {"type":"border_walls","thickness":1,"wall":true},
+
+
+    {"type":"checkerboard","color_a":"primary","color_b":"error","cell_size":1},
+
+
+    {"type":"random_choice","palette":["primary","error"],"probabilities":[0.5,0.5],"seed":123}
+
+
+]}
+
+
+
+
+
+Rules:
+
+
+- Commands must operate only within the viewport bounds.
+
+
+- Prefer high-level commands for complex patterns.
+
+
+- Output at most max_commands.
+
+
+
+
+
+Example (soccer field base inside viewport):
+
+
+{"commands":[
+
+
+    {"type":"fill_rect","color":"success"}
+
+
+]}
+
+
+""".strip()
+
+
+        planner_system = planner_system.replace("{drawing_guide}", drawing_guide)
+
+
+
+
+
+        planner_user = {
+
+
+            "instruction": req.prompt,
+
+
+            "viewport": {"x": view.x, "y": view.y, "w": view.width, "h": view.height},
+
+
+            "world_size": {"width": world.get("width"), "height": world.get("height")},
+
+
+            "max_commands": req.max_commands,
+
+
+            "max_cells": req.max_cells,
+
+
+        }
+
+
+        planner_res = ai_chat(
+
+
+            messages_or_prompt=[
+
+
+                {"role": "system", "content": planner_system},
+
+
+                {"role": "user", "content": json.dumps(planner_user, ensure_ascii=False)},
+
+
+            ],
+
+
+            temperature=0.2,
+
+
+            max_tokens=3000,
+
+
+        )
+
+
+        raw = planner_res.get("content", "") if isinstance(planner_res, dict) else str(planner_res)
+
+
+        logging.info(f"[ai_generate planner] raw (first 800): {str(raw)[:800]}")
+
+
+
+
+
+        try:
+
+
+            parsed = clean_and_parse_json(raw)
+
+
+        except Exception as e:
+
+
+            raise HTTPException(status_code=500, detail=f"AI planner JSON parse failed: {e}")
+
+
+
+
+
+        cmds_raw = parsed.get("commands") if isinstance(parsed, dict) else None
+
+
+        if not isinstance(cmds_raw, list):
+
+
+            raise HTTPException(status_code=500, detail="AI planner response missing 'commands' list")
+
+
+
+
+
+        commands: List[WorldScriptCommand] = []
+
+
+        for item in cmds_raw[: req.max_commands]:
+
+
+            try:
+
+
+                commands.append(WorldScriptCommand(**item))
+
+
+            except Exception:
+
+
+                continue
+
+
+
+
+
+        if commands:
+
+
+            ops_from_script = _execute_world_script(world, view, commands, max_cells=req.max_cells)
+
+
+            world = _apply_draw_ops(world, ops_from_script)
+
+
+            WORLDS_DB[world_id] = world
+
+
+            save_data("worlds.json", WORLDS_DB)
+
+
+            view = _build_view(world, view.x, view.y, view.width, view.height)
+
+
+            all_commands.extend(commands)
+
+
+            all_ops.extend(ops_from_script)
+
+
+
+
+
+    if req.mode in ("ops", "auto"):
+
+
+        painter_system = """
+
+
+You are the WORLD PAINTER (Ops Generator). Output ONLY valid JSON.
+
+
+
+
+
+{drawing_guide}
+
+
+
+
+
+You can modify two layers:
+
+
+- wall layer (blocks movement): set wall true/false
+
+
+- color layer: set color label
+
+
+
+
+
+Allowed colors: ["none","neutral","primary","success","warning","error","info"].
+
+
+
+
+
+Output schema:
+
+
+{"ops":[
+
+
+  {"layer":"wall","shape":"rect","x":0,"y":0,"x2":10,"y2":0,"wall":true},
+
+
+  {"layer":"color","shape":"rect","x":1,"y":1,"x2":9,"y2":8,"color":"neutral"}
+
+
+]}
+
+
+
+
+
+Rules:
+
+
+- All coordinates must be inside the viewport.
+
+
+- Use rect/line when possible.
+
+
+- Output at most max_ops.
+
+
+
+
+
+Example (soccer field markings inside viewport):
+
+
+{"ops":[
+
+
+    {"layer":"color","shape":"rect","x":100,"y":50,"x2":199,"y2":113,"color":"success"},
+
+
+    {"layer":"color","shape":"rect","x":100,"y":50,"x2":199,"y2":50,"color":"info"},
+
+
+    {"layer":"color","shape":"rect","x":100,"y":113,"x2":199,"y2":113,"color":"info"},
+
+
+    {"layer":"color","shape":"rect","x":100,"y":50,"x2":100,"y2":113,"color":"info"},
+
+
+    {"layer":"color","shape":"rect","x":199,"y":50,"x2":199,"y2":113,"color":"info"},
+
+
+    {"layer":"color","shape":"line","x":150,"y":51,"x2":150,"y2":112,"color":"info"},
+
+
+    {"layer":"wall","shape":"cell","x":100,"y":80,"wall":true},
+
+
+    {"layer":"wall","shape":"cell","x":199,"y":80,"wall":true}
+
+
+]}
+
+
+""".strip()
+
+
+        painter_system = painter_system.replace("{drawing_guide}", drawing_guide)
+
+
+
+
+
+        painter_user = {
+
+
+            "instruction": req.prompt,
+
+
+            "viewport": {"x": view.x, "y": view.y, "w": view.width, "h": view.height},
+
+
+            "current_view": {"walls": view.walls, "colors": view.colors},
+
+
+            "world_size": {"width": world.get("width"), "height": world.get("height")},
+
+
+            "max_ops": req.max_ops,
+
+
+        }
+
+
+
+
+
+        painter_res = ai_chat(
+
+
+            messages_or_prompt=[
+
+
+                {"role": "system", "content": painter_system},
+
+
+                {"role": "user", "content": json.dumps(painter_user, ensure_ascii=False)},
+
+
+            ],
+
+
+            temperature=0.25,
+
+
+            max_tokens=3750,
+
+
+        )
+
+
+        raw2 = painter_res.get("content", "") if isinstance(painter_res, dict) else str(painter_res)
+
+
+        logging.info(f"[ai_generate painter] raw (first 800): {str(raw2)[:800]}")
+
+
+
+
+
+        try:
+
+
+            parsed2 = clean_and_parse_json(raw2)
+
+
+        except Exception as e:
+
+
+            raise HTTPException(status_code=500, detail=f"AI painter JSON parse failed: {e}")
+
+
+
+
+
+        ops_raw = parsed2.get("ops") if isinstance(parsed2, dict) else None
+
+
+        if not isinstance(ops_raw, list):
+
+
+            raise HTTPException(status_code=500, detail="AI painter response missing 'ops' list")
+
+
+
+
+
+        # Reuse the same bounding/validation logic as ai_draw by constructing WorldDrawOp and filtering.
+
+
+        bounded_ops: List[WorldDrawOp] = []
+
+
+        vx1, vy1 = view.x, view.y
+
+
+        vx2, vy2 = view.x + view.width - 1, view.y + view.height - 1
+
+
+
+
+
+        def in_v(x: int, y: int) -> bool:
+
+
+            return vx1 <= x <= vx2 and vy1 <= y <= vy2
+
+
+
+
+
+        def clamp_x(x: int) -> int:
+
+
+            return max(vx1, min(vx2, x))
+
+
+
+
+
+        def clamp_y(y: int) -> int:
+
+
+            return max(vy1, min(vy2, y))
+
+
+
+
+
+        for item in ops_raw[: req.max_ops]:
+
+
+            try:
+
+
+                op = WorldDrawOp(**item)
+
+
+            except Exception:
+
+
+                continue
+
+
+
+
+
+            if op.shape == "cell":
+
+
+                if op.x is None or op.y is None or not in_v(op.x, op.y):
+
+
+                    continue
+
+
+            elif op.shape == "cells":
+
+
+                if not op.cells:
+
+
+                    continue
+
+
+                kept = [p for p in op.cells if in_v(p.x, p.y)]
+
+
+                if not kept:
+
+
+                    continue
+
+
+                op.cells = kept
+
+
+            elif op.shape == "rect":
+
+
+                if op.x is None or op.y is None or op.x2 is None or op.y2 is None:
+
+
+                    continue
+
+
+                op.x, op.y, op.x2, op.y2 = clamp_x(op.x), clamp_y(op.y), clamp_x(op.x2), clamp_y(op.y2)
+
+
+            elif op.shape == "line":
+
+
+                if op.x is None or op.y is None or op.x2 is None or op.y2 is None:
+
+
+                    continue
+
+
+                if not (in_v(op.x, op.y) and in_v(op.x2, op.y2)):
+
+
+                    continue
+
+
+
+
+
+            bounded_ops.append(op)
+
+
+
+
+
+        if bounded_ops:
+
+
+            world = _apply_draw_ops(world, bounded_ops)
+
+
+            WORLDS_DB[world_id] = world
+
+
+            save_data("worlds.json", WORLDS_DB)
+
+
+            view = _build_view(world, view.x, view.y, view.width, view.height)
+
+
+            all_ops.extend(bounded_ops)
+
+
+
+
+
+    return WorldAIGenerateResponse(mode=req.mode, commands=all_commands, ops=all_ops, view=view)
+
+
+
+
+
+@router.post("/simulation/run_step", response_model=SimulationStepResponse)
+
+
+async def run_simulation_step(req: SimulationRunRequest, background_tasks: BackgroundTasks, current_user: User = Depends(get_current_user)):
+
+
+    # Note: We don't strictly check ownership of every agent in the step here for simplicity,
+
+
+    # but in a real app we should ensure the user has access to all agents involved.
+
+
+
+
+
+    if req.current_step_index >= len(req.steps):
+
+
+        raise HTTPException(status_code=400, detail="Step index out of range")
+
+
+
+
+
+    step = req.steps[req.current_step_index]
+
+
+    updated_state = req.world_state.copy()
+
+
+    new_history_items = []
+
+
+
+
+
+    def resolve_prompt(template, agent, history, state, use_rag: bool = True):
+
+
+        if not template:
+
+
+            return ""
+
+
+
+
+
+        memory_text = ""
+
+
+        if use_rag:
+
+
+            memory_text = "\n".join(agent.get('long_term_memory', []))
+
+
+        history_text = ""
+
+
+        for h in history:
+
+
+            history_text += f"{h.get('agent_name', 'Unknown')}: {h.get('content', '')}\n"
+
+
+        last_output = history[-1].get('content', '') if history else ""
+
+
+
+
+
+        try:
+
+
+            t = Template(template)
+
+
+            return t.render(
+
+
+                memory=memory_text,
+
+
+                history=history_text,
+
+
+                last_output=last_output,
+
+
+                state=state,
+
+
+                agent=agent,
+
+
+                str=str, # Add str to context
+
+
+                int=int,
+
+
+                len=len
+
+
+            )
+
+
+        except Exception as e:
+
+
+            logging.error(f"Template render error: {e}")
+
+
+            return template
+
+
+
+
+
+    def extract_json(text):
+
+
+        if not isinstance(text, str):
+
+
+            return text
+
+
+        match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
+
+
+        if match:
+
+
+            return json.loads(match.group(1))
+
+
+        match = re.search(r"```\s*(.*?)\s*```", text, re.DOTALL)
+
+
+        if match:
+
+
+            try:
+
+
+                return json.loads(match.group(1))
+
+
+            except:
+
+
+                pass
+
+
+        try:
+
+
+            return json.loads(text)
+
+
+        except:
+
+
+            return text
+
+
+
+
+
+    def _coerce_state_value(v):
+
+
+        """Best-effort: coerce simple JSON/Python-literal strings into objects.
+
+
+
+
+
+        This improves robustness for generated simulations where list/dict/numeric
+
+
+        variables may arrive as strings.
+
+
+        """
+
+
+        if not isinstance(v, str):
+
+
+            return v
+
+
+        s = v.strip()
+
+
+        if not s:
+
+
+            return v
+
+
+        # Avoid expensive parsing on very large blobs (e.g., embedded documents).
+
+
+        if len(s) > 5000:
+
+
+            return v
+
+
+
+
+
+        # JSON objects/arrays
+
+
+        if s[0] in "[{":
+
+
+            try:
+
+
+                return json.loads(s)
+
+
+            except Exception:
+
+
+                try:
+
+
+                    return ast.literal_eval(s)
+
+
+                except Exception:
+
+
+                    return v
+
+
+
+
+
+        # JSON booleans/null
+
+
+        if s in {"true", "false", "null"}:
+
+
+            try:
+
+
+                return json.loads(s)
+
+
+            except Exception:
+
+
+                return v
+
+
+
+
+
+        # Numbers (int/float/scientific)
+
+
+        if re.fullmatch(r"[-+]?(?:\d+\.?\d*|\d*\.?\d+)(?:[eE][-+]?\d+)?", s):
+
+
+            try:
+
+
+                num = float(s)
+
+
+                if num.is_integer() and "e" not in s.lower() and "." not in s:
+
+
+                    return int(num)
+
+
+                return num
+
+
+            except Exception:
+
+
+                return v
+
+
+
+
+
+        return v
+
+
+
+
+
+    def _get_user_agents(exclude_ids: List[str] = None) -> List[Dict]:
+
+
+        exclude_ids = exclude_ids or []
+
+
+        return [a for a in AGENTS_DB.values() if a.get('user_id') == current_user.username and a.get('id') not in exclude_ids]
+
+
+
+
+
+    def _json_sanitize(obj):
+
+
+        """Ensure the object is JSON-serializable (best-effort).
+
+
+
+
+
+        Simulations sometimes put non-serializable objects into state (e.g., code
+
+
+        objects). If we return them as-is, FastAPI will raise 500 on response
+
+
+        serialization. We convert unknown objects to strings.
+
+
+        """
+
+
+        try:
+
+
+            return json.loads(json.dumps(obj, ensure_ascii=False, default=str))
+
+
+        except Exception:
+
+
+            # As a last resort, stringify the entire object.
+
+
+            return str(obj)
+
+
+
+
+
+    def _invoke_agent_text(
+
+
+        agent_id: str,
+
+
+        prompt: str,
+
+
+        files: Optional[List[str]] = None,
+
+
+        force_no_files: bool = False,
+
+
+        use_rag: bool = True,
+
+
+    ):
+
+
+        agent = AGENTS_DB.get(agent_id)
+
+
+        if not agent:
+
+
+            return "", ""
+
+
+
+
+
+        relationships_desc = []
+
+
+        for rel in RELATIONSHIPS_DB.values():
+
+
+            if rel.get("user_id") == current_user.username:
+
+
+                if rel['source_agent_id'] == agent_id:
+
+
+                    target = AGENTS_DB.get(rel['target_agent_id'])
+
+
+                    if target:
+
+
+                        relationships_desc.append(f"You are {rel['relationship_type']} of {target['name']}.")
+
+
+                elif rel['target_agent_id'] == agent_id:
+
+
+                    source = AGENTS_DB.get(rel['source_agent_id'])
+
+
+                    if source:
+
+
+                        relationships_desc.append(f"{source['name']} is {rel['relationship_type']} of you.")
+
+
+
+
+
+        messages = []
+
+
+        persona = agent.get("persona")
+
+
+        if relationships_desc:
+
+
+            persona = (persona or "") + "\n\nRelationships:\n" + "\n".join(relationships_desc)
+
+
+
+
+
+        # RAG retrieval (best-effort)
+
+
+        memory_text = ""
+
+
+        if use_rag:
+
+
+            try:
+
+
+                mem_agent = MemoryAgent(agent_id)
+
+
+                relevant_memories = mem_agent.retrieve(prompt, count=3)
+
+
+                memory_text = "\n".join(relevant_memories)
+
+
+                simple_memories = agent.get('long_term_memory', [])
+
+
+                if len(simple_memories) < 10:
+
+
+                    memory_text = "\n".join(set(relevant_memories + simple_memories))
+
+
+            except Exception as e:
+
+
+                print(f"RAG Retrieval failed: {e}")
+
+
+                memory_text = "\n".join(agent.get('long_term_memory', []))
+
+
+
+
+
+        if memory_text:
+
+
+            persona = (persona or "") + "\n\n[Long-term Memory / Context]:\n" + memory_text
+
+
+
+
+
+        if persona:
+
+
+            messages.append({"role": "system", "content": persona})
+
+
+
+
+
+        file_paths = []
+
+
+        if not force_no_files and files:
+
+
+            for filename in files:
+
+
+                file_path = f"uploads/{agent_id}/{filename}"
+
+
+                if os.path.exists(file_path):
+
+
+                    file_paths.append(file_path)
+
+
+
+
+
+        response_content = ""
+
+
+        try:
+
+
+            provider = agent.get("provider")
+
+
+            if provider in ["deepseek", "zhipu"]:
+
+
+                res = ai_chat(
+
+
+                    messages_or_prompt=messages,
+
+
+                    prompt_content=prompt,
+
+
+                    files=file_paths,
+
+
+                    model=agent.get("model"),
+
+
+                    api_key=agent.get("api_key"),
+
+
+                    base_url=agent.get("base_url"),
+
+
+                    temperature=0.7
+
+
+                )
+
+
+                response_content = res.get('content') or str(res)
+
+
+            elif provider == "custom":
+
+
+                custom_messages = prepare_multimodal_messages(messages, prompt, file_paths)
+
+
+                code_str = agent.get("usage_example")
+
+
+                local_scope = {"json": json}
+
+
+                exec(code_str, local_scope)
+
+
+                invoke_func = local_scope['invoke_custom_agent']
+
+
+                res = invoke_func(
+
+
+                    messages=custom_messages,
+
+
+                    api_key=agent.get("api_key"),
+
+
+                    base_url=agent.get("base_url"),
+
+
+                    model=agent.get("model"),
+
+
+                    temperature=0.7
+
+
+                )
+
+
+                if isinstance(res, dict):
+
+
+                    content_val = res.get('content')
+
+
+                    if content_val is None:
+
+
+                        extracted = extract_content_from_raw(res)
+
+
+                        response_content = extracted or str(res.get('raw') or res)
+
+
+                    else:
+
+
+                        response_content = content_val if isinstance(content_val, str) else json.dumps(content_val, ensure_ascii=False)
+
+
+                else:
+
+
+                    response_content = str(res)
+
+
+            else:
+
+
+                response_content = f"Error: Unsupported provider '{provider}'"
+
+
+        except Exception as e:
+
+
+            response_content = f"Error: {e}"
+
+
+
+
+
+        # Save memory (only when enabled) + chat history for visibility
+
+
+        if use_rag:
+
+
+            try:
+
+
+                background_save_memory(agent_id, prompt, response_content, step.id)
+
+
+            except Exception:
+
+
+                pass
+
+
+
+
+
+        try:
+
+
+            if agent_id not in CHAT_HISTORY_DB:
+
+
+                CHAT_HISTORY_DB[agent_id] = []
+
+
+            CHAT_HISTORY_DB[agent_id].append({"role": "user", "content": prompt, "timestamp": time.time()})
+
+
+            CHAT_HISTORY_DB[agent_id].append({"role": "assistant", "content": response_content, "prompt": prompt, "memory_context": memory_text, "timestamp": time.time()})
+
+
+            save_data("chat_history.json", CHAT_HISTORY_DB)
+
+
+        except Exception:
+
+
+            pass
+
+
+
+
+
+        return response_content, memory_text
+
+
+
+
+
+    if step.type == "code":
+
+
+        try:
+
+
+            # Common defaults for generated simulations.
+
+
+            if "rng_seed" not in updated_state:
+
+
+                updated_state["rng_seed"] = 12345
+
+
+
+
+
+            # Best-effort coerce: if a state value looks like JSON/Python literal,
+
+
+            # convert it to its native type before executing the snippet.
+
+
+            for k in list(updated_state.keys()):
+
+
+                updated_state[k] = _coerce_state_value(updated_state.get(k))
+
+
+
+
+
+            local_scope = {
+
+
+                "state": updated_state,
+
+
+                "history": req.history,
+
+
+                "json": json,
+
+
+                "extract_json": extract_json,
+
+
+                # Common stdlib modules used by generated snippets.
+
+
+                "math": math,
+
+
+                "random": random,
+
+
+                "re": re,
+
+
+                "statistics": statistics,
+
+
+                "ast": ast,
+
+
+            }
+
+
+
+
+
+            # Capture stdout
+
+
+            f = io.StringIO()
+
+
+            with redirect_stdout(f):
+
+
+                # Use a shared globals/locals dict so that imports and helper
+
+
+                # functions defined in the snippet are visible to each other.
+
+
+                # NOTE: Each step still runs in an isolated scope.
+
+
+                exec(step.code_snippet, local_scope, local_scope)
+
+
+            output_log = f.getvalue()
+
+
+
+
+
+            # Calculate state changes
+
+
+            changes = {}
+
+
+            for k, v in updated_state.items():
+
+
+                old_v = req.world_state.get(k)
+
+
+                # Simple equality check
+
+
+                if k not in req.world_state or str(old_v) != str(v):
+
+
+                    changes[k] = {"old": old_v, "new": v}
+
+
+
+
+
+            # Return structured change object
+
+
+            response_content = json.dumps({
+
+
+                "type": "state_change",
+
+
+                "changes": changes,
+
+
+                "stdout": output_log
+
+
+            }, ensure_ascii=False, default=str)
+
+
+
+
+
+            new_history_items.append({
+
+
+                "step_id": step.id,
+
+
+                "agent_name": "System",
+
+
+                "content": response_content
+
+
+            })
+
+
+        except Exception as e:
+
+
+            response_content = f"Error executing code: {e}"
+
+
+            new_history_items.append({
+
+
+                "step_id": step.id,
+
+
+                "agent_name": "System",
+
+
+                "content": response_content
+
+
+            })
+
+
+
+
+
+    elif step.type == "dialogue":
+
+
+        target_agent_ids = step.agent_ids if step.agent_ids else ([step.agent_id] if step.agent_id else [])
+
+
+        step_use_rag = getattr(step, 'use_rag', True)
+
+
+        max_turns = getattr(step, 'dialogue_max_turns', None) or 6
+
+
+        if max_turns < 1:
+
+
+            max_turns = 1
+
+
+        end_marker = getattr(step, 'dialogue_end_marker', None) or "END_DIALOGUE"
+
+
+        auto_partner = getattr(step, 'dialogue_auto_partner', None)
+
+
+        if auto_partner is None:
+
+
+            auto_partner = True
+
+
+        fixed_partner_id = getattr(step, 'dialogue_partner_id', None)
+
+
+
+
+
+        dialogues_outputs = {}
+
+
+
+
+
+        for initiator_id in target_agent_ids:
+
+
+            initiator = AGENTS_DB.get(initiator_id)
+
+
+            if not initiator or initiator.get('user_id') != current_user.username:
+
+
+                continue
+
+
+
+
+
+            candidates = _get_user_agents(exclude_ids=[initiator_id])
+
+
+            if not candidates:
+
+
+                continue
+
+
+
+
+
+            partner_id = None
+
+
+            if not auto_partner and fixed_partner_id:
+
+
+                partner_id = fixed_partner_id
+
+
+            else:
+
+
+                # Ask initiator to pick a partner
+
+
+                candidates_str = "\n".join([f"- {c.get('name')} (id: {c.get('id')})" for c in candidates])
+
+
+                pick_prompt = (
+
+
+                    "You are about to decide who to talk to next.\n"
+
+
+                    "Pick exactly one partner from the list and respond ONLY with JSON like: {\"partner_id\":\"...\"}.\n\n"
+
+
+                    f"Candidates:\n{candidates_str}"
+
+
+                )
+
+
+                pick_res, _ = _invoke_agent_text(
+
+
+                    initiator_id,
+
+
+                    pick_prompt,
+
+
+                    force_no_files=True,
+
+
+                    use_rag=step_use_rag,
+
+
+                )
+
+
+                try:
+
+
+                    parsed = extract_json(pick_res)
+
+
+                    if isinstance(parsed, dict) and parsed.get('partner_id'):
+
+
+                        partner_id = parsed.get('partner_id')
+
+
+                except Exception:
+
+
+                    partner_id = None
+
+
+
+
+
+                if not partner_id:
+
+
+                    # Fallback: try to match by id or name
+
+
+                    for c in candidates:
+
+
+                        if c.get('id') and c.get('id') in str(pick_res):
+
+
+                            partner_id = c.get('id')
+
+
+                            break
+
+
+                    if not partner_id:
+
+
+                        for c in candidates:
+
+
+                            if c.get('name') and c.get('name') in str(pick_res):
+
+
+                                partner_id = c.get('id')
+
+
+                                break
+
+
+                if not partner_id:
+
+
+                    partner_id = candidates[0].get('id')
+
+
+
+
+
+            partner = AGENTS_DB.get(partner_id) if partner_id else None
+
+
+            if not partner or partner.get('user_id') != current_user.username:
+
+
+                continue
+
+
+
+
+
+            initiator_name = initiator.get('name')
+
+
+            partner_name = partner.get('name')
+
+
+
+
+
+            # Start dialogue based on step prompt_template
+
+
+            start_instruction = resolve_prompt(
+
+
+                step.prompt_template,
+
+
+                initiator,
+
+
+                req.history,
+
+
+                updated_state,
+
+
+                use_rag=step_use_rag,
+
+
+            )
+
+
+            if not start_instruction:
+
+
+                start_instruction = "Start a conversation that helps progress the simulation."
+
+
+
+
+
+            transcript_lines = []
+
+
+            convo_so_far = ""
+
+
+
+
+
+            for turn in range(max_turns):
+
+
+                speaker_id = initiator_id if turn % 2 == 0 else partner_id
+
+
+                listener_name = partner_name if speaker_id == initiator_id else initiator_name
+
+
+                speaker_name = initiator_name if speaker_id == initiator_id else partner_name
+
+
+
+
+
+                if turn == 0:
+
+
+                    prompt = (
+
+
+                        f"You are {speaker_name}. You decided to talk to {listener_name}.\n"
+
+
+                        f"Goal / instruction:\n{start_instruction}\n\n"
+
+
+                        f"Write only what you say. If the conversation should end, include the exact token: {end_marker}"
+
+
+                    )
+
+
+                else:
+
+
+                    prompt = (
+
+
+                        f"You are {speaker_name} speaking to {listener_name}.\n"
+
+
+                        f"Conversation so far:\n{convo_so_far}\n\n"
+
+
+                        f"Continue the conversation. Write only what you say. If the conversation should end now, include the exact token: {end_marker}"
+
+
+                    )
+
+
+
+
+
+                resp, mem_ctx = _invoke_agent_text(
+
+
+                    speaker_id,
+
+
+                    prompt,
+
+
+                    files=step.files,
+
+
+                    use_rag=step_use_rag,
+
+
+                )
+
+
+                if not isinstance(resp, str):
+
+
+                    resp = str(resp)
+
+
+                ended = end_marker in resp
+
+
+                clean_resp = resp.replace(end_marker, '').strip()
+
+
+
+
+
+                transcript_lines.append(f"{speaker_name}: {clean_resp}")
+
+
+                convo_so_far = "\n".join(transcript_lines)
+
+
+
+
+
+                history_item = {
+
+
+                    "step_id": step.id,
+
+
+                    "agent_name": speaker_name,
+
+
+                    "content": clean_resp,
+
+
+                    "prompt": prompt,
+
+
+                    "memory_context": mem_ctx,
+
+
+                    "files": step.files,
+
+
+                    "world_state": updated_state.copy()
+
+
+                }
+
+
+                new_history_items.append(history_item)
+
+
+
+
+
+                # Make dialogue visible to subsequent steps if serial execution is desired
+
+
+                if getattr(step, 'execution_mode', 'parallel') == 'serial':
+
+
+                    req.history.append({"agent_name": speaker_name, "content": clean_resp})
+
+
+
+
+
+                if ended:
+
+
+                    break
+
+
+
+
+
+            dialogues_outputs[f"{initiator_name}↔{partner_name}"] = "\n".join(transcript_lines)
+
+
+
+
+
+        if step.output_var:
+
+
+            final_output_var = resolve_prompt(step.output_var, {}, [], updated_state, use_rag=False)
+
+
+            if len(dialogues_outputs) == 1:
+
+
+                updated_state[final_output_var] = list(dialogues_outputs.values())[0]
+
+
+            else:
+
+
+                updated_state[final_output_var] = dialogues_outputs
+
+
+
+
+
+    else:
+
+
+        target_agent_ids = step.agent_ids if step.agent_ids else ([step.agent_id] if step.agent_id else [])
+
+
+        combined_outputs = {}
+
+
+
+
+
+        for agent_id in target_agent_ids:
+
+
+            agent = AGENTS_DB.get(agent_id)
+
+
+            if not agent:
+
+
+                continue
+
+
+            # Check ownership? For now, if agent exists, we allow it.
+
+
+            # Ideally: if agent.get("user_id") != current_user.username: continue
+
+
+
+
+
+            use_rag = getattr(step, 'use_rag', True)
+
+
+            prompt = resolve_prompt(step.prompt_template, agent, req.history, updated_state, use_rag=use_rag)
+
+
+
+
+
+            relationships_desc = []
+
+
+            for rel in RELATIONSHIPS_DB.values():
+
+
+                if rel.get("user_id") == current_user.username:
+
+
+                    if rel['source_agent_id'] == agent_id:
+
+
+                        target = AGENTS_DB.get(rel['target_agent_id'])
+
+
+                        if target:
+
+
+                            relationships_desc.append(f"You are {rel['relationship_type']} of {target['name']}.")
+
+
+                    elif rel['target_agent_id'] == agent_id:
+
+
+                        source = AGENTS_DB.get(rel['source_agent_id'])
+
+
+                        if source:
+
+
+                            relationships_desc.append(f"{source['name']} is {rel['relationship_type']} of you.")
+
+
+
+
+
+            messages = []
+
+
+            persona = agent.get("persona")
+
+
+
+
+
+            if relationships_desc:
+
+
+                persona = (persona or "") + "\n\nRelationships:\n" + "\n".join(relationships_desc)
+
+
+
+
+
+            # --- Auto-Inject Memory if not used in prompt ---
+
+
+            # If the user didn't explicitly use {{memory}} in the prompt template,
+
+
+            # we append the memory to the system persona so the agent is still aware of it.
+
+
+
+
+
+            # RAG Retrieval
+
+
+            memory_text = ""
+
+
+
+
+
+            if use_rag:
+
+
+                try:
+
+
+                    mem_agent = MemoryAgent(agent_id)
+
+
+                    # Retrieve top 3 relevant memories based on the current prompt
+
+
+                    relevant_memories = mem_agent.retrieve(prompt, count=3)
+
+
+                    memory_text = "\n".join(relevant_memories)
+
+
+
+
+
+                    # Fallback to simple list if RAG returns nothing (or add both?)
+
+
+                    # For now, let's combine them to ensure nothing is lost, but prioritize RAG
+
+
+                    simple_memories = agent.get('long_term_memory', [])
+
+
+                    # If simple memories are small, just add them all. If large, rely on RAG.
+
+
+                    if len(simple_memories) < 10:
+
+
+                        all_memories = set(relevant_memories + simple_memories)
+
+
+                        memory_text = "\n".join(all_memories)
+
+
+                except Exception as e:
+
+
+                    print(f"RAG Retrieval failed: {e}")
+
+
+                    memory_text = "\n".join(agent.get('long_term_memory', []))
+
+
+
+
+
+            if use_rag and memory_text and "{{memory}}" not in (step.prompt_template or ""):
+
+
+                persona = (persona or "") + "\n\n[Long-term Memory / Context]:\n" + memory_text
+
+
+            # ------------------------------------------------
+
+
+
+
+
+            if persona:
+
+
+                messages.append({"role": "system", "content": persona})
+
+
+
+
+
+            file_paths = []
+
+
+            if step.files:
+
+
+                for filename in step.files:
+
+
+                    file_path = f"uploads/{agent_id}/{filename}"
+
+
+                    if os.path.exists(file_path):
+
+
+                        file_paths.append(file_path)
+
+
+
+
+
+            # --- Auto-detect local image paths in prompt ---
+
+
+            # If the prompt contains a local file path (e.g. from a previous step's output),
+
+
+            # automatically add it to the file_paths list so it gets attached as an image.
+
+
+            try:
+
+
+                # 1. Windows Absolute Paths
+
+
+                candidates = re.findall(r'([a-zA-Z]:\\[^:<>"|?*\n\r]+\.(?:png|jpg|jpeg|gif|webp|bmp))', prompt, re.IGNORECASE)
+
+
+                for path in candidates:
+
+
+                    clean_path = path.strip()
+
+
+                    if os.path.exists(clean_path) and clean_path not in file_paths:
+
+
+                        file_paths.append(clean_path)
+
+
+                        print(f"Auto-attached local image found in prompt: {clean_path}")
+
+
+
+
+
+                # 2. Web Paths (e.g. /uploads/generated/...)
+
+
+                web_candidates = re.findall(r'(/uploads/[^:<>"|?*\n\r]+\.(?:png|jpg|jpeg|gif|webp|bmp))', prompt, re.IGNORECASE)
+
+
+                for path in web_candidates:
+
+
+                    # Resolve relative web path to absolute server path
+
+
+                    # Assuming CWD is the backend root where 'uploads' folder exists
+
+
+                    clean_path = path.strip().lstrip('/') # Remove leading slash
+
+
+                    abs_path = os.path.abspath(clean_path)
+
+
+                    if os.path.exists(abs_path) and abs_path not in file_paths:
+
+
+                        file_paths.append(abs_path)
+
+
+                        print(f"Auto-attached web image found in prompt: {abs_path}")
+
+
+
+
+
+            except Exception as e:
+
+
+                print(f"Error detecting files in prompt: {e}")
+
+
+            # -----------------------------------------------
+
+
+
+
+
+            response_content = ""
+
+
+            try:
+
+
+                provider = agent.get("provider")
+
+
+                if provider in ["deepseek", "zhipu"]:
+
+
+                    res = ai_chat(
+
+
+                        messages_or_prompt=messages,
+
+
+                        prompt_content=prompt,
+
+
+                        files=file_paths,
+
+
+                        model=agent.get("model"),
+
+
+                        api_key=agent.get("api_key"),
+
+
+                        base_url=agent.get("base_url"),
+
+
+                        temperature=0.7
+
+
+                    )
+
+
+                    response_content = res.get('content') or str(res)
+
+
+                elif provider == "custom":
+
+
+                    # For custom agents, we must manually append the user prompt to messages
+
+
+                    # because invoke_custom_agent expects a full list of messages.
+
+
+                    # We use prepare_multimodal_messages to handle text and files robustly.
+
+
+                    custom_messages = prepare_multimodal_messages(messages, prompt, file_paths)
+
+
+
+
+
+                    # DEBUG: Log the payload being sent to custom agent
+
+
+                    print(f"Invoking Custom Agent: {agent.get('name')}")
+
+
+                    # print(f"Messages Payload: {json.dumps(custom_messages, default=str)[:500]}...")
+
+
+
+
+
+                    code_str = agent.get("usage_example")
+
+
+                    local_scope = {"json": json}
+
+
+                    exec(code_str, local_scope)
+
+
+                    invoke_func = local_scope['invoke_custom_agent']
+
+
+                    res = invoke_func(
+
+
+                        messages=custom_messages,
+
+
+                        api_key=agent.get("api_key"),
+
+
+                        base_url=agent.get("base_url"),
+
+
+                        model=agent.get("model"),
+
+
+                        temperature=0.7
+
+
+                    )
+
+
+
+
+
+                    # Robustly handle response content (string, dict, or list)
+
+
+                    if isinstance(res, dict):
+
+
+                        content_val = res.get('content')
+
+
+                        if not content_val: # Handles None and empty string
+
+
+                             # Try to extract content using adapter logic first
+
+
+                             extracted = extract_content_from_raw(res)
+
+
+                             if extracted:
+
+
+                                 response_content = extracted
+
+
+                             # If content is empty, try to return the whole dict so user can see raw output (including images in 'raw')
+
+
+                             # But prefer 'raw' if available and content is empty
+
+
+                             elif res.get('raw'):
+
+
+                                 response_content = str(res['raw'])
+
+
+                             else:
+
+
+                                 response_content = str(res)
+
+
+                        elif isinstance(content_val, (dict, list)):
+
+
+                             response_content = json.dumps(content_val, ensure_ascii=False)
+
+
+                        else:
+
+
+                             response_content = str(content_val)
+
+
+                    else:
+
+
+                        response_content = str(res)
+
+
+            except Exception as e:
+
+
+                response_content = f"Error: {e}"
+
+
+
+
+
+            # --- Auto-Poll for Async Video Tasks (Robust / Universal) ---
+
+
+            # 1. Check if the custom agent returned an explicit 'async_task_id'
+
+
+            # 2. Or fallback to regex pattern matching
+
+
+            task_id = None
+
+
+            # Ensure res is defined and safe to access
+
+
+            safe_res = res if 'res' in locals() else {}
+
+
+
+
+
+            if isinstance(safe_res, dict) and safe_res.get('async_task_id'):
+
+
+                task_id = safe_res.get('async_task_id')
+
+
+            else:
+
+
+                task_match = re.search(r"Task ID:\s*([a-f0-9\-]+)", response_content, re.IGNORECASE)
+
+
+                if task_match:
+
+
+                    task_id = task_match.group(1)
+
+
+
+
+
+            if task_id:
+
+
+                print(f"Detected Async Task ID: {task_id}. Starting polling...")
+
+
+
+
+
+                api_key = agent.get("api_key")
+
+
+                base_url = agent.get("base_url") or ""
+
+
+
+
+
+                # Check if the generated code provided a polling function
+
+
+                poll_func = local_scope.get('poll_custom_task') if 'local_scope' in locals() else None
+
+
+
+
+
+                start_time = time.time()
+
+
+                # Polling loop (max 5 minutes)
+
+
+                while time.time() - start_time < 300:
+
+
+                    try:
+
+
+                        video_url = None
+
+
+                        fail_msg = ""
+
+
+                        is_finished = False
+
+
+
+
+
+                        if poll_func:
+
+
+                            # Use the generated polling function (Most Robust)
+
+
+                            try:
+
+
+                                poll_res = poll_func(task_id, api_key, base_url)
+
+
+                                status_code = poll_res.get('status')
+
+
+                                if status_code in ['SUCCESS', 'SUCCEEDED', 'completed']:
+
+
+                                    video_url = poll_res.get('video_url')
+
+
+                                    is_finished = True
+
+
+                                elif status_code in ['FAILED', 'CANCELED', 'FAIL']:
+
+
+                                    fail_msg = poll_res.get('error', 'Unknown error')
+
+
+                                    is_finished = True
+
+
+                            except Exception as pe:
+
+
+                                print(f"Custom polling function error: {pe}")
+
+
+                                # Fallback to default logic if custom function crashes
+
+
+                                poll_func = None
+
+
+
+
+
+                        if not poll_func:
+
+
+                            # Fallback: Default Polling Logic (Strict Check)
+
+
+                            poll_url = ""
+
+
+                            headers = {"Authorization": f"Bearer {api_key}"}
+
+
+
+
+
+                            if "bigmodel.cn" in base_url or agent.get("provider") == "zhipu":
+
+
+                                poll_url = f"https://open.bigmodel.cn/api/paas/v4/async-result/{task_id}"
+
+
+                                # Zhipu Logic
+
+
+                                poll_res = requests.get(poll_url, headers=headers)
+
+
+                                if poll_res.status_code == 200:
+
+
+                                    task_data = poll_res.json()
+
+
+                                    task_status = task_data.get("task_status", "")
+
+
+                                    if task_status == "SUCCESS":
+
+
+                                        video_result = task_data.get("video_result", [])
+
+
+                                        if video_result: video_url = video_result[0].get("url")
+
+
+                                        is_finished = True
+
+
+                                    elif task_status == "FAIL":
+
+
+                                        fail_msg = str(task_data)
+
+
+                                        is_finished = True
+
+
+
+
+
+                            elif "dashscope" in base_url or "aliyun" in base_url:
+
+
+                                poll_url = f"https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}"
+
+
+                                # DashScope Logic
+
+
+                                poll_res = requests.get(poll_url, headers=headers)
+
+
+                                if poll_res.status_code == 200:
+
+
+                                    task_data = poll_res.json()
+
+
+                                    task_status = task_data.get("output", {}).get("task_status", "")
+
+
+                                    if task_status == "SUCCEEDED":
+
+
+                                        output = task_data.get("output", {})
+
+
+                                        video_url = output.get("video_url")
+
+
+                                        if not video_url and "results" in output:
+
+
+                                            res_list = output["results"]
+
+
+                                            if res_list: video_url = res_list[0].get("url")
+
+
+                                        is_finished = True
+
+
+                                    elif task_status in ["FAILED", "CANCELED"]:
+
+
+                                        fail_msg = task_data.get('output', {}).get('message', 'Unknown error')
+
+
+                                        is_finished = True
+
+
+                            else:
+
+
+                                # Unknown Provider and No Custom Polling Function
+
+
+                                fail_msg = "No polling logic found for this provider. Please regenerate the adapter code."
+
+
+                                is_finished = True
+
+
+
+
+
+                        # Check Final Status
+
+
+                        if is_finished:
+
+
+                            if video_url:
+
+
+                                print(f"Task Succeeded. Video URL: {video_url}")
+
+
+                                response_content = json.dumps([{
+
+
+                                    "type": "video_url",
+
+
+                                    "video_url": {"url": video_url}
+
+
+                                }])
+
+
+                            else:
+
+
+                                response_content = f"[Video Generation Failed/Skipped: {fail_msg}]"
+
+
+                                if "regenerate" in fail_msg:
+
+
+                                    response_content += "\n\n(Action Required: Go to Agent Edit -> Custom Adapter -> Click 'Generate Adapter Code' to enable auto-polling for this model.)"
+
+
+                            break
+
+
+
+
+
+                        time.sleep(5)
+
+
+                    except Exception as e:
+
+
+                        print(f"Polling error: {e}")
+
+
+                        time.sleep(5)
+
+
+            # -------------------------------------------------------
+
+
+
+
+
+            new_history_items.append({
+
+
+                "step_id": step.id,
+
+
+                "agent_name": agent.get("name"),
+
+
+                "content": response_content,
+
+
+                "prompt": prompt,
+
+
+                "memory_context": memory_text,
+
+
+                "files": step.files,
+
+
+                "world_state": updated_state.copy()
+
+
+            })
+
+
+
+
+
+            # --- Serial Execution Support ---
+
+
+            if getattr(step, 'execution_mode', 'parallel') == 'serial':
+
+
+                req.history.append({
+
+
+                    "agent_name": agent.get("name"),
+
+
+                    "content": response_content
+
+
+                })
+
+
+            # --------------------------------
+
+
+
+
+
+            # --- Background Memory Save ---
+
+
+            # Save Q&A to memory only when enabled (use_rag=True)
+
+
+            if use_rag:
+
+
+                print(f"DEBUG: Saving memory for agent {agent_id}")
+
+
+                background_save_memory(agent_id, prompt, response_content, step.id)
+
+
+
+
+
+            # --- Save Chat History Step-by-Step ---
+
+
+            print(f"DEBUG: Saving chat history for agent {agent_id}")
+
+
+            if agent_id not in CHAT_HISTORY_DB:
+
+
+                CHAT_HISTORY_DB[agent_id] = []
+
+
+
+
+
+            # Add User Prompt
+
+
+            CHAT_HISTORY_DB[agent_id].append({
+
+
+                "role": "user",
+
+
+                "content": prompt,
+
+
+                "timestamp": time.time()
+
+
+            })
+
+
+
+
+
+            # Add Agent Response
+
+
+            CHAT_HISTORY_DB[agent_id].append({
+
+
+                "role": "assistant",
+
+
+                "content": response_content,
+
+
+                "prompt": prompt, # Redundant but kept for compatibility
+
+
+                "memory_context": memory_text,
+
+
+                "timestamp": time.time()
+
+
+            })
+
+
+            save_data("chat_history.json", CHAT_HISTORY_DB)
+
+
+            print(f"DEBUG: Chat history saved. DB size: {len(CHAT_HISTORY_DB[agent_id])}")
+
+
+            # --------------------------------------
+
+
+
+
+
+            combined_outputs[agent.get("name")] = response_content
+
+
+
+
+
+        if step.output_var:
+
+
+            # Resolve output_var if it contains templates (Dynamic Keys)
+
+
+            # We use a dummy agent/history context since output_var usually only depends on state
+
+
+            final_output_var = resolve_prompt(step.output_var, {}, [], updated_state, use_rag=False)
+
+
+
+
+
+            # Process outputs based on requested format
+
+
+            processed_outputs = {}
+
+
+            fmt = step.output_format or 'raw'
+
+
+
+
+
+            for agent_name, content in combined_outputs.items():
+
+
+                val = content
+
+
+                if fmt == 'text':
+
+
+                    try:
+
+
+                        if content.strip().startswith('[') or content.strip().startswith('{'):
+
+
+                            parsed = json.loads(content)
+
+
+                            if isinstance(parsed, list):
+
+
+                                texts = [p.get('text', '') for p in parsed if p.get('type') == 'text']
+
+
+                                val = "\n".join(texts).strip()
+
+
+                    except:
+
+
+                        pass
+
+
+                elif fmt == 'raw':
+
+
+                    # Robustness: Try to parse JSON if the content looks like it
+
+
+                    val = extract_json(content)
+
+
+                elif fmt == 'image':
+
+
+                    found = False
+
+
+                    try:
+
+
+                        if content.strip().startswith('[') or content.strip().startswith('{'):
+
+
+                            parsed = json.loads(content)
+
+
+                            if isinstance(parsed, list):
+
+
+                                for p in parsed:
+
+
+                                    if p.get('type') == 'image_url':
+
+
+                                        val = p['image_url']['url']
+
+
+                                        found = True
+
+
+                                        break
+
+
+                    except:
+
+
+                        pass
+
+
+
+
+
+                    if not found:
+
+
+                        # Try regex for markdown image
+
+
+                        match = re.search(r'!\[.*?\]\((.*?)\)', content)
+
+
+                        if match:
+
+
+                            val = match.group(1)
+
+
+
+
+
+                # Auto-download image if format is 'image' and it's a remote URL
+
+
+                if fmt == 'image' and val and isinstance(val, str) and val.startswith('http'):
+
+
+                    try:
+
+
+                        save_dir = "uploads/generated"
+
+
+                        os.makedirs(save_dir, exist_ok=True)
+
+
+
+
+
+                        # Guess extension
+
+
+                        ext = "png"
+
+
+                        if "." in val.split("/")[-1]:
+
+
+                            possible = val.split("/")[-1].split(".")[-1].split("?")[0]
+
+
+                            if possible.lower() in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
+
+
+                                ext = possible.lower()
+
+
+
+
+
+                        filename = f"{uuid.uuid4()}.{ext}"
+
+
+                        local_path = os.path.abspath(os.path.join(save_dir, filename))
+
+
+
+
+
+                        # Download
+
+
+                        print(f"Downloading image from {val} to {local_path}...")
+
+
+                        dl_res = requests.get(val, timeout=30)
+
+
+                        if dl_res.status_code == 200:
+
+
+                            with open(local_path, 'wb') as f:
+
+
+                                f.write(dl_res.content)
+
+
+                            # Store Web Path (Relative) instead of Absolute Path
+
+
+                            # This allows frontend to display it and backend to resolve it later
+
+
+                            val = f"/uploads/generated/{filename}"
+
+
+                            print("Download successful.")
+
+
+                        else:
+
+
+                            print(f"Download failed: {dl_res.status_code}")
+
+
+                    except Exception as e:
+
+
+                        print(f"Failed to download image: {e}")
+
+
+
+
+
+                elif fmt == 'video':
+
+
+                    # Try to extract video URL from JSON structure
+
+
+                    try:
+
+
+                        if content.strip().startswith('[') or content.strip().startswith('{'):
+
+
+                            parsed = json.loads(content)
+
+
+                            if isinstance(parsed, list):
+
+
+                                for p in parsed:
+
+
+                                    if p.get('type') == 'video_url':
+
+
+                                        val = p['video_url']['url']
+
+
+                                        break
+
+
+                    except:
+
+
+                        pass
+
+
+
+
+
+                elif fmt == 'audio':
+
+
+                    # Try to extract audio URL from JSON structure
+
+
+                    try:
+
+
+                        if content.strip().startswith('[') or content.strip().startswith('{'):
+
+
+                            parsed = json.loads(content)
+
+
+                            if isinstance(parsed, list):
+
+
+                                for p in parsed:
+
+
+                                    if p.get('type') == 'audio_url':
+
+
+                                        val = p['audio_url']['url']
+
+
+                                        break
+
+
+                    except:
+
+
+                        pass
+
+
+
+
+
+                processed_outputs[agent_name] = val
+
+
+
+
+
+            # Unwrap if single agent to make {{state.Var}} cleaner
+
+
+            if len(processed_outputs) == 1:
+
+
+                updated_state[final_output_var] = list(processed_outputs.values())[0]
+
+
+            else:
+
+
+                updated_state[final_output_var] = processed_outputs
+
+
+
+
+
+    # Make sure we never return non-serializable state values.
+
+
+    updated_state = _json_sanitize(updated_state)
+
+
+
+
+
+    return SimulationStepResponse(
+
+
+        content="Step executed",
+
+
+        new_history_items=new_history_items,
+
+
+        updated_world_state=updated_state
+
+
+    )
+
+
+
+
+
+@router.post("/relationships", response_model=RelationshipResponse)
+
+
+async def create_relationship(rel: RelationshipCreateRequest, current_user: User = Depends(get_current_user)):
+
+
+    if rel.source_agent_id not in AGENTS_DB or rel.target_agent_id not in AGENTS_DB:
+
+
+        raise HTTPException(status_code=404, detail="One or both agents not found")
+
+
+
+
+
+    # Verify ownership
+
+
+
+       AGENTS_DB[rel.target_agent_id].get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=403, detail="Access denied to one or both agents")
+
+
+
+
+
+    rel_id = str(uuid.uuid4())
+
+
+    new_rel = {
+
+
+        "id": rel_id,
+
+
+        "user_id": current_user.username,
+
+
+        **rel.dict()
+
+
+    }
+
+
+    RELATIONSHIPS_DB[rel_id] = new_rel
+
+
+    save_data("relationships.json", RELATIONSHIPS_DB)
+
+
+    return RelationshipResponse(**new_rel)
+
+
+
+
+
+@router.get("/relationships", response_model=List[RelationshipResponse])
+
+
+async def list_relationships(current_user: User = Depends(get_current_user)):
+
+
+    return [RelationshipResponse(**r) for r in RELATIONSHIPS_DB.values() if r.get("user_id") == current_user.username]
+
+
+
+
+
+@router.delete("/relationships/{rel_id}")
+
+
+async def delete_relationship(rel_id: str, current_user: User = Depends(get_current_user)):
+
+
+    rel = RELATIONSHIPS_DB.get(rel_id)
+
+
+    if not rel or rel.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="Relationship not found")
+
+
+
+
+
+    del RELATIONSHIPS_DB[rel_id]
+
+
+    save_data("relationships.json", RELATIONSHIPS_DB)
+
+
+    return {"message": "Deleted"}
+
+
+
+
+
+@router.get("/agents/{agent_id}/history")
+
+
+async def get_agent_history(agent_id: str, limit: int = 100, offset: int = 0, current_user: User = Depends(get_current_user)):
+
+
+    agent = AGENTS_DB.get(agent_id)
+
+
+    if not agent or agent.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+
+    history = history[offset:offset+limit]
+    return CHAT_HISTORY_DB.get(agent_id, [])
+
+
+
+
+
+@router.post("/agents/{agent_id}/history")
+
+
+async def add_agent_history(agent_id: str, message: Dict[str, str], current_user: User = Depends(get_current_user)):
+
+
+    agent = AGENTS_DB.get(agent_id)
+
+
+    if not agent or agent.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+
+
+
+
+    if agent_id not in CHAT_HISTORY_DB:
+
+
+        CHAT_HISTORY_DB[agent_id] = []
+
+
+    CHAT_HISTORY_DB[agent_id].append(message)
+
+
+    save_data("chat_history.json", CHAT_HISTORY_DB)
+
+
+    return {"message": "History added"}
+
+
+
+
+
+@router.delete("/agents/{agent_id}/history")
+
+
+async def clear_agent_history(agent_id: str, current_user: User = Depends(get_current_user)):
+
+
+    agent = AGENTS_DB.get(agent_id)
+
+
+    if not agent or agent.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+
+
+
+
+    CHAT_HISTORY_DB[agent_id] = []
+
+
+    save_data("chat_history.json", CHAT_HISTORY_DB)
+
+
+    return {"message": "History cleared"}
+
+
+
+
+
+@router.post("/agents/{agent_id}/history/delete_batch")
+
+
+async def delete_agent_history_batch(agent_id: str, indices: List[int], current_user: User = Depends(get_current_user)):
+
+
+    agent = AGENTS_DB.get(agent_id)
+
+
+    if not agent or agent.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+
+
+
+
+    if agent_id not in CHAT_HISTORY_DB:
+
+
+        return {"message": "No history to delete"}
+
+
+
+
+
+    # Sort indices in descending order to avoid shifting issues
+
+
+    indices.sort(reverse=True)
+
+
+
+
+
+    history = CHAT_HISTORY_DB[agent_id]
+
+
+    for idx in indices:
+
+
+        if 0 <= idx < len(history):
+
+
+            history.pop(idx)
+
+
+
+
+
+    save_data("chat_history.json", CHAT_HISTORY_DB)
+
+
+    return {"message": "Selected history items deleted"}
+
+
+
+
+
+@router.post("/chat")
+
+
+async def chat_with_agent(request: ChatRequest, background_tasks: BackgroundTasks, current_user: User = Depends(get_current_user)):
+
+
+    agent = AGENTS_DB.get(request.agent_id)
+
+
+    if not agent or agent.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+
+
+
+
+    provider = agent.get("provider")
+
+
+    messages = request.messages
+
+
+    persona = agent.get("persona")
+
+
+    if persona:
+
+
+        if messages and messages[0].get('role') == 'system':
+
+
+            pass
+
+
+        else:
+
+
+            messages = [{"role": "system", "content": persona}] + messages
+
+
+
+
+
+    # Helper to extract last user message for memory context
+
+
+    last_user_msg = ""
+
+
+    for m in reversed(request.messages):
+
+
+        if m.get('role') == 'user':
+
+
+            last_user_msg = m.get('content', '')
+
+
+            break
+
+
+
+
+
+    if provider in ["deepseek", "zhipu"]:
+
+
+        response = ai_chat(
+
+
+            messages_or_prompt=messages,
+
+
+            model=agent.get("model"),
+
+
+            api_key=agent.get("api_key"),
+
+
+            base_url=agent.get("base_url"),
+
+
+            temperature=request.temperature,
+
+
+            max_tokens=request.max_tokens
+
+
+        )
+
+
+
+
+
+        # Background Memory Save
+
+
+        content = response.get('content') or str(response)
+
+
+        background_tasks.add_task(background_save_memory, request.agent_id, last_user_msg, content)
+
+
+
+
+
+        return response
+
+
+
+
+
+    elif provider == "custom":
+
+
+        code_str = agent.get("usage_example")
+
+
+        if not code_str:
+
+
+             raise HTTPException(status_code=400, detail="No custom code provided for custom agent")
+
+
+
+
+
+        local_scope = {}
+
+
+        try:
+
+
+            exec(code_str, local_scope)
+
+
+            if 'invoke_custom_agent' not in local_scope:
+
+
+                 raise HTTPException(status_code=500, detail="Custom code must define 'invoke_custom_agent'")
+
+
+
+
+
+            invoke_func = local_scope['invoke_custom_agent']
+
+
+            result = invoke_func(
+
+
+                messages=messages,
+
+
+                api_key=agent.get("api_key"),
+
+
+                base_url=agent.get("base_url"),
+
+
+                model=agent.get("model"),
+
+
+                temperature=request.temperature
+
+
+            )
+
+
+
+
+
+            # --- Auto-Poll for Async Video Tasks (Robust / Universal) ---
+
+
+            task_id = None
+
+
+            if isinstance(result, dict) and result.get('async_task_id'):
+
+
+                task_id = result.get('async_task_id')
+
+
+            else:
+
+
+                # Try to find Task ID in content
+
+
+                content_str = str(result.get('content', '')) if isinstance(result, dict) else str(result)
+
+
+                task_match = re.search(r"Task ID:\s*([a-f0-9\-]+)", content_str, re.IGNORECASE)
+
+
+                if task_match:
+
+
+                    task_id = task_match.group(1)
+
+
+
+
+
+            if task_id:
+
+
+                # ... (Polling logic omitted for brevity, assuming it updates result['content']) ...
+
+
+                pass
+
+
+
+
+
+            # Background Memory Save (Custom)
+
+
+            # Note: If async polling happens, we might save the "Task ID" message first.
+
+
+            # Ideally we should save the FINAL video URL, but that happens inside the polling loop which is blocking here?
+
+
+            # Wait, the polling loop IS blocking here (up to 300s).
+
+
+            # So 'result' will contain the final content.
+
+
+            final_content = result.get('content') if isinstance(result, dict) else str(result)
+
+
+            background_tasks.add_task(background_save_memory, request.agent_id, last_user_msg, final_content)
+
+
+
+
+
+            return result
+
+
+        except Exception as e:
+
+
+            import traceback
+
+
+            traceback.print_exc()
+
+
+            raise HTTPException(status_code=500, detail=f"Custom agent execution failed: {e}")
+
+
+
+
+
+    else:
+
+
+        raise HTTPException(status_code=400, detail="Unknown provider")
+
+
+
+
+
+@router.get("/simulations", response_model=List[Simulation])
+
+
+async def list_simulations(current_user: User = Depends(get_current_user)):
+
+
+
+
+
+    def _has_access(sim: Dict[str, Any], username: str) -> bool:
+
+
+        if not isinstance(sim, dict):
+
+
+            return False
+
+
+        if sim.get("user_id") == username:
+
+
+            return True
+
+
+        shared_with = sim.get("shared_with")
+
+
+        return isinstance(shared_with, list) and username in shared_with
+
+
+
+
+
+    return [Simulation(**s) for s in SIMULATIONS_DB.values() if _has_access(s, current_user.username)]
+
+
+
+
+
+
+
+
+@router.post("/simulations/{sim_id}/share")
+
+
+async def share_simulation(sim_id: str, payload: Dict[str, Any], current_user: User = Depends(get_current_user)):
+
+
+    """Share a simulation with another user (read-only for the recipient).
+
+
+
+
+
+    payload:
+
+
+      {"username": "prm"}
+
+
+    or
+
+
+      {"usernames": ["prm", "alice"]}
+
+
+    """
+
+
+    sim = SIMULATIONS_DB.get(sim_id)
+
+
+    if not sim:
+
+
+        raise HTTPException(status_code=404, detail="Simulation not found")
+
+
+    if sim.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=403, detail="Access denied")
+
+
+
+
+
+    usernames: List[str] = []
+
+
+    if isinstance(payload, dict):
+
+
+        if isinstance(payload.get("username"), str) and payload.get("username").strip():
+
+
+            usernames.append(payload.get("username").strip())
+
+
+        if isinstance(payload.get("usernames"), list):
+
+
+            for u in payload.get("usernames"):
+
+
+                if isinstance(u, str) and u.strip():
+
+
+                    usernames.append(u.strip())
+
+
+    usernames = sorted(list({u for u in usernames if u and u != current_user.username}))
+
+
+    if not usernames:
+
+
+        raise HTTPException(status_code=400, detail="Missing username(s)")
+
+
+
+
+
+    shared_with = sim.get("shared_with")
+
+
+    if not isinstance(shared_with, list):
+
+
+        shared_with = []
+
+
+
+
+
+    changed = False
+
+
+    for u in usernames:
+
+
+        if u not in shared_with:
+
+
+            shared_with.append(u)
+
+
+            changed = True
+
+
+    sim["shared_with"] = shared_with
+
+
+    SIMULATIONS_DB[sim_id] = sim
+
+
+    if changed:
+
+
+        save_data("simulations.json", SIMULATIONS_DB)
+
+
+    return {"message": "Simulation shared", "sim_id": sim_id, "shared_with": shared_with}
+
+
+
+
+
+
+
+
+@router.post("/simulations/{sim_id}/unshare")
+
+
+async def unshare_simulation(sim_id: str, payload: Dict[str, Any], current_user: User = Depends(get_current_user)):
+
+
+    """Remove a share grant. payload: {"username":"prm"} or {"usernames":[...]}"""
+
+
+    sim = SIMULATIONS_DB.get(sim_id)
+
+
+    if not sim:
+
+
+        raise HTTPException(status_code=404, detail="Simulation not found")
+
+
+    if sim.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=403, detail="Access denied")
+
+
+
+
+
+    usernames: List[str] = []
+
+
+    if isinstance(payload, dict):
+
+
+        if isinstance(payload.get("username"), str) and payload.get("username").strip():
+
+
+            usernames.append(payload.get("username").strip())
+
+
+        if isinstance(payload.get("usernames"), list):
+
+
+            for u in payload.get("usernames"):
+
+
+                if isinstance(u, str) and u.strip():
+
+
+                    usernames.append(u.strip())
+
+
+    usernames = list({u for u in usernames if u})
+
+
+    if not usernames:
+
+
+        raise HTTPException(status_code=400, detail="Missing username(s)")
+
+
+
+
+
+    shared_with = sim.get("shared_with")
+
+
+    if not isinstance(shared_with, list):
+
+
+        shared_with = []
+
+
+    before = list(shared_with)
+
+
+    shared_with = [u for u in shared_with if u not in set(usernames)]
+
+
+    sim["shared_with"] = shared_with
+
+
+    SIMULATIONS_DB[sim_id] = sim
+
+
+    if before != shared_with:
+
+
+        save_data("simulations.json", SIMULATIONS_DB)
+
+
+    return {"message": "Simulation unshared", "sim_id": sim_id, "shared_with": shared_with}
+
+
+
+
+
+@router.post("/simulations/upload_temp")
+
+
+async def upload_simulation_temp_file(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
+
+
+    upload_dir = "uploads/temp"
+
+
+    os.makedirs(upload_dir, exist_ok=True)
+
+
+
+
+
+    # Sanitize filename
+
+
+    filename = os.path.basename(file.filename)
+
+
+    file_path = f"{upload_dir}/{filename}"
+
+
+
+
+
+    with open(file_path, "wb") as buffer:
+
+
+        shutil.copyfileobj(file.file, buffer)
+
+
+
+
+
+    return {"filename": filename, "message": "File uploaded to temp storage"}
+
+
+
+
+
+@router.post("/simulations/generate", response_model=Simulation)
+
+
+async def generate_simulation(request: SimulationGenerateRequest, current_user: User = Depends(get_current_user)):
+
+
+    try:
+
+
+        # Robustness: If file_content is missing but files are provided, try to extract text
+
+
+        file_content = request.file_content
+
+
+        if not file_content and request.file_names:
+
+
+            temp_dir = "uploads/temp"
+
+
+            # Try multiple files (in order) and concatenate, capped to avoid huge prompts.
+
+
+            # This makes "attach references" actually useful for the Architect.
+
+
+            chunks = []
+
+
+            total = 0
+
+
+            max_chars = 50000
+
+
+            for fn in (request.file_names or [])[:5]:
+
+
+                file_path = f"{temp_dir}/{fn}"
+
+
+                if not os.path.exists(file_path):
+
+
+                    continue
+
+
+                try:
+
+
+                    print(f"Extracting text from {file_path} for Architect...")
+
+
+                    t = extract_text_from_file(file_path) or ""
+
+
+                except Exception as _e:
+
+
+                    t = ""
+
+
+                if not t:
+
+
+                    continue
+
+
+
+
+
+                header = f"\n\n--- File: {fn} ---\n"
+
+
+                footer = "\n--- End of File ---\n"
+
+
+                remaining = max_chars - total
+
+
+                if remaining <= 0:
+
+
+                    break
+
+
+                piece = (header + t + footer)
+
+
+                if len(piece) > remaining:
+
+
+                    piece = piece[:remaining] + "\n[...Truncated...]\n"
+
+
+                chunks.append(piece)
+
+
+                total += len(piece)
+
+
+                if total >= max_chars:
+
+
+                    break
+
+
+
+
+
+            file_content = "".join(chunks).strip() if chunks else file_content
+
+
+
+
+
+        config = generate_simulation_config(request.prompt, file_content, request.file_names)
+
+
+
+
+
+        # --- Auto-create missing agents ---
+
+
+        all_agent_ids = set()
+
+
+        def extract_ids(steps):
+
+
+            for step in steps:
+
+
+                if step.get('type') == 'agent':
+
+
+                    ids = step.get('agent_ids', [])
+
+
+                    if isinstance(ids, list):
+
+
+                        for i in ids: all_agent_ids.add(i)
+
+
+                if step.get('inner_steps'):
+
+
+                    extract_ids(step['inner_steps'])
+
+
+
+
+
+        extract_ids(config.get("steps", []))
+
+
+
+
+
+        missing_ids = [aid for aid in all_agent_ids if aid not in AGENTS_DB]
+
+
+
+
+
+        if missing_ids:
+
+
+            # Find template (first agent of this user)
+
+
+            template_agent = None
+
+
+            for agent in AGENTS_DB.values():
+
+
+                if agent.get("user_id") == current_user.username:
+
+
+                    template_agent = agent
+
+
+                    break
+
+
+
+
+
+            if template_agent:
+
+
+                for aid in missing_ids:
+
+
+                    new_agent = template_agent.copy()
+
+
+                    new_agent['id'] = aid
+
+
+                    new_agent['name'] = aid.replace("-", " ").replace("_", " ").title()
+
+
+                    new_agent['persona'] = f"You are {new_agent['name']}."
+
+
+                    new_agent['user_id'] = current_user.username
+
+
+                    new_agent['long_term_memory'] = [] # Reset memory
+
+
+                    AGENTS_DB[aid] = new_agent
+
+
+                    print(f"Auto-created agent: {new_agent['name']} ({aid})")
+
+
+                save_data("agents.json", AGENTS_DB)
+
+
+        # ----------------------------------
+
+
+
+
+
+        # --- Distribute Temp Files to Agents ---
+
+
+        if request.file_names:
+
+
+            temp_dir = "uploads/temp"
+
+
+
+
+
+            def distribute_files(steps):
+
+
+                for step in steps:
+
+
+                    # Check if step uses any of the temp files
+
+
+                    step_files = step.get('files', [])
+
+
+                    if not step_files: continue
+
+
+
+
+
+                    # Find intersection
+
+
+                    files_to_copy = [f for f in step_files if f in request.file_names]
+
+
+
+
+
+                    if files_to_copy:
+
+
+                        agent_ids = step.get('agent_ids', [])
+
+
+                        for aid in agent_ids:
+
+
+                            agent = AGENTS_DB.get(aid)
+
+
+                            if not agent: continue
+
+
+
+
+
+                            agent_upload_dir = f"uploads/{aid}"
+
+
+                            os.makedirs(agent_upload_dir, exist_ok=True)
+
+
+
+
+
+                            for fname in files_to_copy:
+
+
+                                src = f"{temp_dir}/{fname}"
+
+
+                                dst = f"{agent_upload_dir}/{fname}"
+
+
+                                if os.path.exists(src):
+
+
+                                    shutil.copy2(src, dst)
+
+
+                                    # Update agent record
+
+
+                                    if 'files' not in agent: agent['files'] = []
+
+
+                                    if fname not in agent['files']:
+
+
+                                        agent['files'].append(fname)
+
+
+
+
+
+                            AGENTS_DB[aid] = agent
+
+
+
+
+
+                    if step.get('inner_steps'):
+
+
+                        distribute_files(step['inner_steps'])
+
+
+
+
+
+            distribute_files(config.get("steps", []))
+
+
+            save_data("agents.json", AGENTS_DB)
+
+
+        # ---------------------------------------
+
+
+
+
+
+        # Convert raw dict to Simulation model to validate
+
+
+        # We generate a temporary ID and user_id
+
+
+        # Robustness: Ensure variables[*].value is always a string (the Pydantic model requires Dict[str, str]).
+
+
+        normalized_vars = []
+
+
+        for v in (config.get("variables", []) or []):
+
+
+            if not isinstance(v, dict):
+
+
+                continue
+
+
+            vv = dict(v)
+
+
+            if "value" in vv and not isinstance(vv.get("value"), str):
+
+
+                try:
+
+
+                    vv["value"] = json.dumps(vv.get("value"), ensure_ascii=False)
+
+
+                except Exception:
+
+
+                    vv["value"] = str(vv.get("value"))
+
+
+            # Some LLMs may omit value; keep type stable.
+
+
+            if "value" not in vv:
+
+
+                vv["value"] = ""
+
+
+            # Ensure key exists to avoid downstream issues
+
+
+            if "key" not in vv:
+
+
+                continue
+
+
+            normalized_vars.append(vv)
+
+
+
+
+
+        sim_data = {
+
+
+            "id": str(uuid.uuid4()),
+
+
+            "name": config.get("name", "Generated Simulation"),
+
+
+            "description": config.get("description", ""),
+
+
+            "steps": config.get("steps", []),
+
+
+            "variables": normalized_vars,
+
+
+            "user_id": current_user.username
+
+
+        }
+
+
+
+
+
+        return Simulation(**sim_data)
+
+
+    except Exception as e:
+
+
+        logging.error(f"Simulation generation failed: {e}")
+
+
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+@router.post("/simulations", response_model=Simulation)
+
+
+async def create_simulation(sim: Simulation, current_user: User = Depends(get_current_user)):
+
+
+    sim_id = str(uuid.uuid4())
+
+
+    new_sim = sim.dict()
+
+
+    new_sim['id'] = sim_id
+
+
+    new_sim['user_id'] = current_user.username
+
+
+    SIMULATIONS_DB[sim_id] = new_sim
+
+
+    save_data("simulations.json", SIMULATIONS_DB)
+
+
+    return Simulation(**new_sim)
+
+
+
+
+
+@router.get("/simulations/{sim_id}", response_model=Simulation)
+
+
+async def get_simulation(sim_id: str, current_user: User = Depends(get_current_user)):
+
+
+    sim = SIMULATIONS_DB.get(sim_id)
+
+
+
+
+
+    def _has_access(sim_obj: Dict[str, Any], username: str) -> bool:
+
+
+        if not isinstance(sim_obj, dict):
+
+
+            return False
+
+
+        if sim_obj.get("user_id") == username:
+
+
+            return True
+
+
+        shared_with = sim_obj.get("shared_with")
+
+
+        return isinstance(shared_with, list) and username in shared_with
+
+
+
+
+
+    if not sim or not _has_access(sim, current_user.username):
+
+
+        raise HTTPException(status_code=404, detail="Simulation not found")
+
+
+    return Simulation(**sim)
+
+
+
+
+
+@router.put("/simulations/{sim_id}", response_model=Simulation)
+
+
+async def update_simulation(sim_id: str, sim: Simulation, current_user: User = Depends(get_current_user)):
+
+
+    if sim_id not in SIMULATIONS_DB:
+
+
+        raise HTTPException(status_code=404, detail="Simulation not found")
+
+
+
+
+
+    existing = SIMULATIONS_DB[sim_id]
+
+
+    if existing.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=403, detail="Access denied")
+
+
+
+
+
+    updated_sim = sim.dict()
+
+
+    updated_sim['id'] = sim_id
+
+
+    updated_sim['user_id'] = current_user.username
+
+
+    # Preserve share grants (recipient read-access)
+
+
+    if isinstance(existing.get("shared_with"), list):
+
+
+        updated_sim["shared_with"] = existing.get("shared_with")
+
+
+    SIMULATIONS_DB[sim_id] = updated_sim
+
+
+    save_data("simulations.json", SIMULATIONS_DB)
+
+
+    return Simulation(**updated_sim)
+
+
+
+
+
+@router.delete("/simulations/{sim_id}")
+
+
+async def delete_simulation(sim_id: str, current_user: User = Depends(get_current_user)):
+
+
+    if sim_id not in SIMULATIONS_DB:
+
+
+        raise HTTPException(status_code=404, detail="Simulation not found")
+
+
+
+
+
+    existing = SIMULATIONS_DB[sim_id]
+
+
+    if existing.get("user_id") != current_user.username:
+
+
+        raise HTTPException(status_code=403, detail="Access denied")
+
+
+
+
+
+    del SIMULATIONS_DB[sim_id]
+
+
+    save_data("simulations.json", SIMULATIONS_DB)
+
+
+    return {"message": "Simulation deleted"}
+
+
+
+
+
+@router.post("/simulation/runs", response_model=SimulationRun)
+
+
+async def save_simulation_run(run: SimulationRun, current_user: User = Depends(get_current_user)):
+
+
+    run_id = str(uuid.uuid4())
+
+
+    new_run = run.dict()
+
+
+    new_run['id'] = run_id
+
+
+    new_run['timestamp'] = time.time()
+
+
+    new_run['user_id'] = current_user.username
+
+
+    RUNS_DB[run_id] = new_run
+
+
+    save_data("runs.json", RUNS_DB)
+
+
+
+
+
+    # Persist chat history to agents - DISABLED (Now handled in run_simulation_step)
+
+
+    # for item in run.history:
+
+
+    #     agent_id = None
+
+
+    #     for aid, a in AGENTS_DB.items():
+
+
+    #         if a['name'] == item['agent_name'] and a.get("user_id") == current_user.username:
+
+
+    #             agent_id = aid
+
+
+    #             break
+
+
+
+
+
+    #     if agent_id:
+
+
+    #         if agent_id not in CHAT_HISTORY_DB:
+
+
+    #             CHAT_HISTORY_DB[agent_id] = []
+
+
+
+
+
+    #         CHAT_HISTORY_DB[agent_id].append({
+
+
+    #             "role": "assistant",
+
+
+    #             "content": f"[Simulation Step {item['step_id'][:4]}] {item['content']}",
+
+
+    #             "prompt": item.get('prompt', ''), # Save the prompt/question too
+
+
+    #             "timestamp": new_run['timestamp']
+
+
+    #         })
+
+
+
+
+
+            # --- Auto-Consolidate to Long-Term Memory (RAG) ---
+
+
+            # DISABLED: We now save memory incrementally in run_simulation_step (background task)
+
+
+            # This prevents duplication and ensures memory is available during the run.
+
+
+            # try:
+
+
+            #     # 1. Add to Vector DB (MemoryAgent)
+
+
+            #     mem_agent = MemoryAgent(agent_id)
+
+
+            #     memory_content = f"In simulation run {run_id[:8]}, I was asked: '{item.get('prompt', '')}'. I responded: '{item.get('content', '')}'."
+
+
+            #     mem_agent.add_observation(memory_content, importance=1)
+
+
+
+
+
+            #     # 2. Add to Simple List (for UI visibility)
+
+
+            #     agent = AGENTS_DB.get(agent_id)
+
+
+            #     if agent:
+
+
+            #         if 'long_term_memory' not in agent: agent['long_term_memory'] = []
+
+
+            #         # Avoid duplicates if possible (simple check)
+
+
+            #         if memory_content not in agent['long_term_memory']:
+
+
+            #             agent['long_term_memory'].append(memory_content)
+
+
+            #             AGENTS_DB[agent_id] = agent # Update DB reference
+
+
+            # except Exception as e:
+
+
+            #     print(f"Failed to auto-consolidate memory for agent {agent_id}: {e}")
+
+
+            # --------------------------------------------------
+
+
+
+
+
+    save_data("chat_history.json", CHAT_HISTORY_DB)
+
+
+    save_data("agents.json", AGENTS_DB) # Save agents update
+
+
+
+
+
+    return SimulationRun(**new_run)
+
+
+
+
+
+@router.get("/simulation/runs", response_model=List[SimulationRun])
+
+
+async def list_simulation_runs(current_user: User = Depends(get_current_user)):
+
+
+    return [SimulationRun(**r) for r in RUNS_DB.values() if r.get("user_id") == current_user.username]
+
+

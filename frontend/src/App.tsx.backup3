@@ -1,0 +1,247 @@
+import React from 'react';
+import { BrowserRouter as Router, Routes, Route, Link, Navigate, useLocation } from 'react-router-dom';
+import { Layout, Menu, Button, Alert } from 'antd';
+import Login from './pages/Login';
+import Register from './pages/Register';
+import PaperStatic from './pages/PaperStatic';
+import { AuthProvider, useAuth } from './context/AuthContext';
+import { SimulationProvider } from './context/SimulationContext';
+
+const { Header, Content, Footer } = Layout;
+
+// Error Boundary for component-level error handling
+class ErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { hasError: boolean; error: Error | null }
+> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error('Component Error:', error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: '20px', textAlign: 'center' }}>
+          <Alert
+            message="Component Loading Error"
+            description={
+              <div>
+                <p>This component failed to load. This might be temporary.</p>
+                <pre style={{ 
+                  backgroundColor: '#f5f5f5', 
+                  padding: '10px', 
+                  borderRadius: '4px',
+                  textAlign: 'left',
+                  fontSize: '12px',
+                  marginTop: '10px'
+                }}>
+                  {this.state.error?.toString()}
+                </pre>
+              </div>
+            }
+            type="warning"
+            showIcon
+          />
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// Enable authentication check
+const PrivateRoute: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+    const { token } = useAuth();
+    const location = useLocation();
+
+    if (!token) {
+        return <Navigate to="/login" state={{ from: location }} replace />;
+    }
+
+    return <>{children}</>;
+};
+
+// Simple test component for other routes
+const TestPage: React.FC<{ name: string }> = ({ name }) => {
+  return (
+    <div style={{ padding: '20px' }}>
+      <h2>{name} Page</h2>
+      <p>This page is under construction or failed to load.</p>
+      <div style={{ marginTop: '20px', padding: '15px', backgroundColor: '#fff3e0' }}>
+        <p>Component loading test: {name}</p>
+      </div>
+    </div>
+  );
+};
+
+// Simple Papers page for testing
+const SimplePapersPage: React.FC = () => {
+  return (
+    <div style={{ padding: '20px' }}>
+      <h2>Paper Reproduction</h2>
+      <p>This is a simplified version of the paper reproduction page.</p>
+      <div style={{ marginTop: '20px', padding: '15px', backgroundColor: '#e8f5e9' }}>
+        <p>✅ Papers page is working in simplified mode</p>
+        <p>The full PaperReproductionPage component is temporarily disabled due to loading errors.</p>
+      </div>
+    </div>
+  );
+};
+
+const AppLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+    const { logout, isAuthenticated } = useAuth();
+    const location = useLocation();
+    
+    const getSelectedKey = () => {
+        if (location.pathname === '/') return ['1'];
+        if (location.pathname.startsWith('/agent')) return ['1'];
+        if (location.pathname === '/relationships') return ['2'];
+        if (location.pathname === '/simulation') return ['3'];
+        if (location.pathname === '/world') return ['4'];
+        if (location.pathname === '/papers') return ['5'];
+        return ['1'];
+    };
+
+    const menuItems = [
+        { key: '1', label: <Link to="/">Agents</Link> },
+        { key: '2', label: <Link to="/relationships">Relationships</Link> },
+        { key: '3', label: <Link to="/simulation">Simulation</Link> },
+        { key: '4', label: <Link to="/world">World</Link> },
+        { key: '5', label: <Link to="/papers">Papers</Link> },
+    ];
+
+    return (
+        <Layout style={{ minHeight: '100vh' }}>
+            <Header style={{ display: 'flex', alignItems: 'center' }}>
+                <div style={{ 
+                    color: 'white', 
+                    fontSize: '18px', 
+                    fontWeight: 'bold', 
+                    marginRight: '24px',
+                    minWidth: '200px'
+                }}>
+                    AI Simulation Platform
+                </div>
+                <Menu
+                    theme="dark"
+                    mode="horizontal"
+                    selectedKeys={getSelectedKey()}
+                    items={menuItems}
+                    style={{ flex: 1 }}
+                />
+                {isAuthenticated ? (
+                    <Button type="link" style={{ color: 'white' }} onClick={logout}>
+                        Logout
+                    </Button>
+                ) : (
+                    <div>
+                        <Link to="/login">
+                            <Button type="link" style={{ color: 'white', marginRight: '8px' }}>
+                                Login
+                            </Button>
+                        </Link>
+                        <Link to="/register">
+                            <Button type="link" style={{ color: 'white' }}>
+                                Register
+                            </Button>
+                        </Link>
+                    </div>
+                )}
+            </Header>
+            
+            <Content style={{ padding: '0 50px', marginTop: '16px' }}>
+                <div style={{ 
+                    background: 'white', 
+                    padding: '24px', 
+                    minHeight: 'calc(100vh - 134px)',
+                    borderRadius: '8px'
+                }}>
+                  <ErrorBoundary>
+                    {children}
+                  </ErrorBoundary>
+                </div>
+            </Content>
+            
+            <Footer style={{ textAlign: 'center' }}>
+                AI Simulation Platform ©{new Date().getFullYear()}
+            </Footer>
+        </Layout>
+    );
+};
+
+const App: React.FC = () => {
+    return (
+        <Router>
+          <ErrorBoundary>
+            <AuthProvider>
+                <SimulationProvider>
+                    <AppLayout>
+                        <Routes>
+                            {/* Public routes */}
+                            <Route path="/login" element={
+                              <ErrorBoundary>
+                                <Login />
+                              </ErrorBoundary>
+                            } />
+                            <Route path="/register" element={
+                              <ErrorBoundary>
+                                <Register />
+                              </ErrorBoundary>
+                            } />
+                            
+                            {/* Protected routes */}
+                            <Route path="/" element={
+                                <PrivateRoute>
+                                  <ErrorBoundary>
+                                    <TestPage name="Home" />
+                                  </ErrorBoundary>
+                                </PrivateRoute>
+                            } />
+                            <Route path="/papers" element={
+                                <PrivateRoute>
+                                  <ErrorBoundary>
+                                    <PaperStatic />
+                                  </ErrorBoundary>
+                                </PrivateRoute>
+                            } />
+                            <Route path="/relationships" element={
+                                <PrivateRoute>
+                                  <ErrorBoundary>
+                                    <TestPage name="Relationships" />
+                                  </ErrorBoundary>
+                                </PrivateRoute>
+                            } />
+                            <Route path="/simulation" element={
+                                <PrivateRoute>
+                                  <ErrorBoundary>
+                                    <TestPage name="Simulation" />
+                                  </ErrorBoundary>
+                                </PrivateRoute>
+                            } />
+                            <Route path="/world" element={
+                                <PrivateRoute>
+                                  <ErrorBoundary>
+                                    <TestPage name="World" />
+                                  </ErrorBoundary>
+                                </PrivateRoute>
+                            } />
+                            <Route path="*" element={<Navigate to="/" replace />} />
+                        </Routes>
+                    </AppLayout>
+                </SimulationProvider>
+            </AuthProvider>
+          </ErrorBoundary>
+        </Router>
+    );
+};
+
+export default App;

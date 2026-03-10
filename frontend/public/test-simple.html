@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test AI Platform Load</title>
+    <meta charset="UTF-8">
+</head>
+<body>
+    <h1>Testing AI Platform Load</h1>
+    <div id="test-result"></div>
+    
+    <script>
+        async function testPlatformLoad() {
+            const resultDiv = document.getElementById('test-result');
+            
+            try {
+                // Fetch the main page
+                const response = await fetch('http://localhost:5173');
+                const html = await response.text();
+                
+                // Check for indicators
+                if (html.includes('AI Simulation Platform')) {
+                    resultDiv.innerHTML = '✅ SUCCESS: AI Simulation Platform detected';
+                    resultDiv.style.color = 'green';
+                } else if (html.includes('Ultra Simple React App')) {
+                    resultDiv.innerHTML = '❌ FAIL: Still showing Ultra Simple React App';
+                    resultDiv.style.color = 'red';
+                } else {
+                    resultDiv.innerHTML = '⚠️ WARNING: Unknown content detected';
+                    resultDiv.style.color = 'orange';
+                    resultDiv.innerHTML += '<pre>' + html.substring(0, 500) + '...</pre>';
+                }
+            } catch (error) {
+                resultDiv.innerHTML = '❌ ERROR: ' + error.message;
+                resultDiv.style.color = 'red';
+            }
+        }
+        
+        testPlatformLoad();
+    </script>
+</body>
+</html>

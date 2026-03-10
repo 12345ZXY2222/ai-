@@ -1,0 +1,672 @@
+import React, { useState, useEffect } from 'react';
+import {
+  Card,
+  Button,
+  Upload,
+  Table,
+  Tag,
+  Space,
+  Typography,
+  Row,
+  Col,
+  message,
+  Progress,
+  Modal,
+  Descriptions,
+  Tabs,
+  Empty,
+  Collapse,
+} from 'antd';
+import {
+  UploadOutlined,
+  EyeOutlined,
+  PlayCircleOutlined,
+  ReloadOutlined,
+  DownloadOutlined,
+  CodeOutlined,
+} from '@ant-design/icons';
+import type { UploadFile, UploadProps } from 'antd';
+import {
+  uploadPaper,
+  getPaperReproductions,
+  getPaperReproduction,
+  analyzePaper,
+  executePaperCode,
+  getPaperParameters,
+  getPaperChartConfigs,
+  executeWithParameters,
+  generateInteractiveChart,
+  PaperReproductionResponse,
+  PaperReproductionStatus,
+  getStatusText,
+  getStatusColor,
+  formatFileSize,
+  formatDate,
+} from '../api/paperApi';
+import InteractiveChart from '../components/InteractiveChart';
+import PaperChat from '../components/PaperChat';
+import PaperComparison from '../components/PaperComparison';
+
+const { Title, Text, Paragraph } = Typography;
+const { TabPane } = Tabs;
+const { Panel } = Collapse;
+
+const PaperReproductionPage: React.FC = () => {
+  const [papers, setPapers] = useState<PaperReproductionResponse[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [selectedPaper, setSelectedPaper] = useState<PaperReproductionResponse | null>(null);
+  const [detailModalVisible, setDetailModalVisible] = useState(false);
+  const [paperParameters, setPaperParameters] = useState<any[]>([]);
+  const [paperChartConfigs, setPaperChartConfigs] = useState<any[]>([]);
+  const [loadingParameters, setLoadingParameters] = useState(false);
+  const [pollingInterval, setPollingInterval] = useState<NodeJS.Timeout | null>(null);
+
+  // 加载论文列表
+  const loadPapers = async () => {
+    setLoading(true);
+    try {
+      const response = await getPaperReproductions(50, 0);
+      setPapers(response.items);
+    } catch (error) {
+      message.error('加载论文列表失败');
+      console.error(error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 初始加载
+  useEffect(() => {
+    loadPapers();
+    return () => {
+      if (pollingInterval) {
+        clearInterval(pollingInterval);
+      }
+    };
+  }, []);
+
+  // 对于处理中的论文，开启轮询
+  useEffect(() => {
+    const hasProcessing = papers.some(
+      (paper) =>
+        paper.status === PaperReproductionStatus.PARSING ||
+        paper.status === PaperReproductionStatus.ANALYZING ||
+        paper.status === PaperReproductionStatus.REPRODUCING ||
+        paper.status === PaperReproductionStatus.EXECUTING
+    );
+
+    if (hasProcessing && !pollingInterval) {
+      const interval = setInterval(() => {
+        loadPapers();
+      }, 5000); // 每5秒刷新一次
+      setPollingInterval(interval);
+    } else if (!hasProcessing && pollingInterval) {
+      clearInterval(pollingInterval);
+      setPollingInterval(null);
+    }
+  }, [papers]);
+
+  // 处理文件上传
+  const handleUpload: UploadProps['beforeUpload'] = async (file) => {
+    setUploading(true);
+    try {
+      await uploadPaper({
+        file,
+        title: file.name.replace(/\.[^/.]+$/, ''), // 移除扩展名作为标题
+      });
+      message.success('论文上传成功，开始分析...');
+      await loadPapers();
+    } catch (error) {
+      message.error('论文上传失败');
+      console.error(error);
+    } finally {
+      setUploading(false);
+    }
+    return false; // 阻止默认上传
+  };
+
+  // 查看论文详情
+  const handleViewDetails = async (paper: PaperReproductionResponse) => {
+    try {
+      const detailedPaper = await getPaperReproduction(paper.id);
+      setSelectedPaper(detailedPaper);
+      setDetailModalVisible(true);
+      
+      // 如果论文已完成且有复现代码，加载参数和图表配置
+      if (detailedPaper.status === PaperReproductionStatus.COMPLETED && detailedPaper.reproduction_code) {
+        setLoadingParameters(true);
+        try {
+          const [paramsResponse, chartsResponse] = await Promise.all([
+            getPaperParameters(detailedPaper.id),
+            getPaperChartConfigs(detailedPaper.id)
+          ]);
+          
+          setPaperParameters(paramsResponse.parameters || []);
+          setPaperChartConfigs(chartsResponse.charts || []);
+        } catch (error) {
+          console.error('加载参数失败:', error);
+          // 如果API端点不存在，从可视化数据中提取
+          if (detailedPaper.visualization_data) {
+            setPaperParameters(detailedPaper.visualization_data.parameters || []);
+            setPaperChartConfigs(detailedPaper.visualization_data.charts || []);
+          }
+        } finally {
+          setLoadingParameters(false);
+        }
+      } else {
+        setPaperParameters([]);
+        setPaperChartConfigs([]);
+      }
+    } catch (error) {
+      message.error('获取论文详情失败');
+      console.error(error);
+    }
+  };
+
+  // 开始分析论文
+  const handleAnalyze = async (paperId: string) => {
+    try {
+      await analyzePaper(paperId);
+      message.success('已开始分析论文，请稍后查看结果');
+      loadPapers();
+    } catch (error) {
+      message.error('开始分析失败');
+      console.error(error);
+    }
+  };
+
+  // 执行论文代码
+  const handleExecute = async (paperId: string) => {
+    try {
+      await executePaperCode(paperId);
+      message.success('代码执行已开始，请稍后查看结果');
+      loadPapers();
+    } catch (error) {
+      message.error('代码执行失败');
+      console.error(error);
+    }
+  };
+
+  // 使用参数执行论文代码
+  const handleExecuteWithParameters = async (parameters: Record<string, any>, chartConfigs: any[]) => {
+    if (!selectedPaper) return;
+    
+    try {
+      await executeWithParameters(selectedPaper.id, parameters, chartConfigs);
+      message.success('代码执行已开始，请稍后查看结果');
+      
+      // 重新加载论文详情
+      const detailedPaper = await getPaperReproduction(selectedPaper.id);
+      setSelectedPaper(detailedPaper);
+      loadPapers();
+    } catch (error) {
+      message.error('代码执行失败');
+      console.error(error);
+    }
+  };
+
+  // 刷新状态
+  const handleRefresh = () => {
+    loadPapers();
+    message.info('已刷新');
+  };
+
+  // 表格列定义
+  const columns = [
+    {
+      title: '论文标题',
+      dataIndex: 'title',
+      key: 'title',
+      render: (text: string) => (
+        <Text strong ellipsis={{ tooltip: text }}>
+          {text}
+        </Text>
+      ),
+    },
+    {
+      title: '状态',
+      dataIndex: 'status',
+      key: 'status',
+      render: (status: PaperReproductionStatus) => (
+        <Tag color={getStatusColor(status)}>{getStatusText(status)}</Tag>
+      ),
+    },
+    {
+      title: '文件大小',
+      dataIndex: 'file_size',
+      key: 'file_size',
+      render: (size: number) => formatFileSize(size),
+    },
+    {
+      title: '上传时间',
+      dataIndex: 'upload_date',
+      key: 'upload_date',
+      render: (date: string) => formatDate(date),
+    },
+    {
+      title: 'AI模型',
+      dataIndex: 'ai_model',
+      key: 'ai_model',
+    },
+    {
+      title: '操作',
+      key: 'action',
+      render: (_: any, record: PaperReproductionResponse) => (
+        <Space>
+          <Button
+            type="link"
+            icon={<EyeOutlined />}
+            onClick={() => handleViewDetails(record)}
+          >
+            详情
+          </Button>
+          {record.status === PaperReproductionStatus.PENDING && (
+            <Button
+              type="link"
+              icon={<PlayCircleOutlined />}
+              onClick={() => handleAnalyze(record.id)}
+            >
+              开始分析
+            </Button>
+          )}
+          {record.status === PaperReproductionStatus.COMPLETED && record.reproduction_code && (
+            <Space>
+              <Button
+                type="link"
+                icon={<DownloadOutlined />}
+                onClick={() => {
+                  // 这里可以添加下载代码的功能
+                  message.info('下载功能开发中');
+                }}
+              >
+                下载代码
+              </Button>
+              <Button
+                type="link"
+                icon={<CodeOutlined />}
+                onClick={() => handleExecute(record.id)}
+              >
+                执行代码
+              </Button>
+            </Space>
+          )}
+        </Space>
+      ),
+    },
+  ];
+
+  // 渲染详情模态框
+  const renderDetailModal = () => {
+    if (!selectedPaper) return null;
+
+    return (
+      <Modal
+        title={`论文详情 - ${selectedPaper.title}`}
+        open={detailModalVisible}
+        onCancel={() => setDetailModalVisible(false)}
+        footer={null}
+        width={800}
+      >
+        <Tabs defaultActiveKey="basic">
+          <TabPane tab="基本信息" key="basic">
+            <Descriptions column={2} bordered>
+              <Descriptions.Item label="标题" span={2}>
+                {selectedPaper.title}
+              </Descriptions.Item>
+              <Descriptions.Item label="状态">
+                <Tag color={getStatusColor(selectedPaper.status)}>
+                  {getStatusText(selectedPaper.status)}
+                </Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="文件大小">
+                {formatFileSize(selectedPaper.file_size)}
+              </Descriptions.Item>
+              <Descriptions.Item label="原始文件名">
+                {selectedPaper.original_filename}
+              </Descriptions.Item>
+              <Descriptions.Item label="上传时间">
+                {formatDate(selectedPaper.upload_date)}
+              </Descriptions.Item>
+              <Descriptions.Item label="AI模型">
+                {selectedPaper.ai_model}
+              </Descriptions.Item>
+              {selectedPaper.description && (
+                <Descriptions.Item label="描述" span={2}>
+                  {selectedPaper.description}
+                </Descriptions.Item>
+              )}
+              {selectedPaper.error_message && (
+                <Descriptions.Item label="错误信息" span={2}>
+                  <Text type="danger">{selectedPaper.error_message}</Text>
+                </Descriptions.Item>
+              )}
+            </Descriptions>
+          </TabPane>
+
+          <TabPane tab="分析结果" key="analysis" disabled={!selectedPaper.analysis_result}>
+            {selectedPaper.analysis_result ? (
+              <Collapse defaultActiveKey={['1']}>
+                <Panel header="论文分析摘要" key="1">
+                  <pre style={{ maxHeight: '300px', overflow: 'auto' }}>
+                    {JSON.stringify(selectedPaper.analysis_result, null, 2)}
+                  </pre>
+                </Panel>
+              </Collapse>
+            ) : (
+              <Empty description="暂无分析结果" />
+            )}
+          </TabPane>
+
+          <TabPane tab="复现代码" key="code" disabled={!selectedPaper.reproduction_code}>
+            {selectedPaper.reproduction_code ? (
+              <div style={{ position: 'relative' }}>
+                <Button
+                  type="primary"
+                  icon={<DownloadOutlined />}
+                  style={{ position: 'absolute', right: 0, top: -40 }}
+                  onClick={() => {
+                    const blob = new Blob([selectedPaper.reproduction_code!], {
+                      type: 'text/plain',
+                    });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `${selectedPaper.title}_reproduction.py`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                >
+                  下载代码
+                </Button>
+                <pre
+                  style={{
+                    maxHeight: '400px',
+                    overflow: 'auto',
+                    backgroundColor: '#f6f8fa',
+                    padding: '16px',
+                    borderRadius: '4px',
+                    marginTop: '16px',
+                  }}
+                >
+                  <code>{selectedPaper.reproduction_code}</code>
+                </pre>
+              </div>
+            ) : (
+              <Empty description="暂无复现代码" />
+            )}
+          </TabPane>
+
+          <TabPane tab="可视化" key="visualization" disabled={!selectedPaper.visualization_data}>
+            {selectedPaper.visualization_data ? (
+              <Collapse defaultActiveKey={['1']}>
+                <Panel header="可视化配置" key="1">
+                  <pre style={{ maxHeight: '300px', overflow: 'auto' }}>
+                    {JSON.stringify(selectedPaper.visualization_data, null, 2)}
+                  </pre>
+                </Panel>
+                <Panel header="预览" key="2">
+                  <Paragraph>
+                    可视化预览功能开发中。根据配置，这里将显示图表、数据表格和交互式元素。
+                  </Paragraph>
+                </Panel>
+              </Collapse>
+            ) : (
+              <Empty description="暂无可视化数据" />
+            )}
+          </TabPane>
+
+          <TabPane tab="执行结果" key="execution" disabled={!selectedPaper.execution_result}>
+            {selectedPaper.execution_result ? (
+              <div>
+                <Descriptions bordered column={1} size="small">
+                  <Descriptions.Item label="执行状态">
+                    <Tag color={selectedPaper.execution_result.success ? 'success' : 'error'}>
+                      {selectedPaper.execution_result.success ? '成功' : '失败'}
+                    </Tag>
+                  </Descriptions.Item>
+                  <Descriptions.Item label="返回代码">
+                    {selectedPaper.execution_result.return_code}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="执行时间">
+                    {selectedPaper.execution_result.execution_time?.toFixed(2)}秒
+                  </Descriptions.Item>
+                  <Descriptions.Item label="执行时间戳">
+                    {formatDate(selectedPaper.execution_result.timestamp)}
+                  </Descriptions.Item>
+                </Descriptions>
+
+                <Tabs defaultActiveKey="stdout" style={{ marginTop: '16px' }}>
+                  <TabPane tab="标准输出" key="stdout">
+                    <pre style={{
+                      maxHeight: '300px',
+                      overflow: 'auto',
+                      backgroundColor: '#f6f8fa',
+                      padding: '16px',
+                      borderRadius: '4px',
+                    }}>
+                      {selectedPaper.execution_result.stdout || '(无输出)'}
+                    </pre>
+                  </TabPane>
+                  <TabPane tab="标准错误" key="stderr">
+                    <pre style={{
+                      maxHeight: '300px',
+                      overflow: 'auto',
+                      backgroundColor: '#fff2f0',
+                      padding: '16px',
+                      borderRadius: '4px',
+                    }}>
+                      {selectedPaper.execution_result.stderr || '(无错误)'}
+                    </pre>
+                  </TabPane>
+                </Tabs>
+
+                {selectedPaper.execution_result.chart_files && selectedPaper.execution_result.chart_files.length > 0 && (
+                  <div style={{ marginTop: '16px' }}>
+                    <Title level={5}>生成的图表文件</Title>
+                    <Paragraph>
+                      {selectedPaper.execution_result.chart_files.join(', ')}
+                    </Paragraph>
+                  </div>
+                )}
+
+                {selectedPaper.status === PaperReproductionStatus.COMPLETED && selectedPaper.reproduction_code && (
+                  <div style={{ marginTop: '24px', textAlign: 'center' }}>
+                    <Button
+                      type="primary"
+                      icon={<CodeOutlined />}
+                      onClick={() => {
+                        handleExecute(selectedPaper.id);
+                        setDetailModalVisible(false);
+                      }}
+                    >
+                      重新执行代码
+                    </Button>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <Empty description="暂无执行结果">
+                {selectedPaper.status === PaperReproductionStatus.COMPLETED && selectedPaper.reproduction_code && (
+                  <Button
+                    type="primary"
+                    icon={<CodeOutlined />}
+                    onClick={() => {
+                      handleExecute(selectedPaper.id);
+                      setDetailModalVisible(false);
+                    }}
+                  >
+                    执行代码
+                  </Button>
+                )}
+              </Empty>
+            )}
+          </TabPane>
+
+          <TabPane tab="交互式可视化" key="interactive" disabled={!selectedPaper.reproduction_code || selectedPaper.status !== PaperReproductionStatus.COMPLETED}>
+            {selectedPaper.status === PaperReproductionStatus.COMPLETED && selectedPaper.reproduction_code ? (
+              <div>
+                {loadingParameters ? (
+                  <div style={{ textAlign: 'center', padding: '40px' }}>
+                    <Paragraph>加载参数配置中...</Paragraph>
+                  </div>
+                ) : paperParameters.length === 0 && paperChartConfigs.length === 0 ? (
+                  <Empty description="暂无可配置参数或图表">
+                    <Paragraph>
+                      系统正在分析代码中的可调参数和图表配置...
+                    </Paragraph>
+                    <Button
+                      type="primary"
+                      onClick={() => {
+                        // 重新加载参数
+                        if (selectedPaper) {
+                          handleViewDetails(selectedPaper);
+                        }
+                      }}
+                    >
+                      重新分析参数
+                    </Button>
+                  </Empty>
+                ) : (
+                  <InteractiveChart
+                    paperId={selectedPaper.id}
+                    title={selectedPaper.title}
+                    chartConfigs={paperChartConfigs}
+                    parameters={paperParameters}
+                    onExecuteWithParameters={handleExecuteWithParameters}
+                  />
+                )}
+              </div>
+            ) : (
+              <Empty description="论文尚未完成或没有复现代码" />
+            )}
+          </TabPane>
+
+          <TabPane tab="AI聊天助手" key="chat" disabled={selectedPaper.status !== PaperReproductionStatus.COMPLETED}>
+            {selectedPaper.status === PaperReproductionStatus.COMPLETED ? (
+              <PaperChat
+                paperId={selectedPaper.id}
+                title={selectedPaper.title}
+                onClose={() => setDetailModalVisible(false)}
+              />
+            ) : (
+              <Empty description="论文分析完成后才能使用聊天功能" />
+            )}
+          </TabPane>
+        </Tabs>
+
+        {selectedPaper.status === PaperReproductionStatus.PENDING && (
+          <div style={{ marginTop: '24px', textAlign: 'center' }}>
+            <Button
+              type="primary"
+              icon={<PlayCircleOutlined />}
+              size="large"
+              onClick={() => {
+                handleAnalyze(selectedPaper.id);
+                setDetailModalVisible(false);
+              }}
+            >
+              开始分析这篇论文
+            </Button>
+          </div>
+        )}
+        {selectedPaper.status === PaperReproductionStatus.COMPLETED && 
+         selectedPaper.reproduction_code && 
+         !selectedPaper.execution_result && (
+          <div style={{ marginTop: '24px', textAlign: 'center' }}>
+            <Button
+              type="primary"
+              icon={<CodeOutlined />}
+              size="large"
+              onClick={() => {
+                handleExecute(selectedPaper.id);
+                setDetailModalVisible(false);
+              }}
+            >
+              执行复现代码
+            </Button>
+          </div>
+        )}
+      </Modal>
+    );
+  };
+
+  return (
+    <div style={{ padding: '24px' }}>
+      <Row gutter={[24, 24]}>
+        <Col span={24}>
+          <Card>
+            <Title level={3}>论文复现与可视化</Title>
+            <Paragraph type="secondary">
+              上传学术论文（PDF/DOCX/TXT），AI将自动分析论文内容，生成复现代码，并提供可视化结果。
+            </Paragraph>
+          </Card>
+        </Col>
+
+        <Col span={24}>
+          <Card title="上传论文">
+            <Upload.Dragger
+              beforeUpload={handleUpload}
+              accept=".pdf,.docx,.txt"
+              showUploadList={false}
+              disabled={uploading}
+            >
+              <p className="ant-upload-drag-icon">
+                <UploadOutlined style={{ fontSize: '48px', color: '#1890ff' }} />
+              </p>
+              <p className="ant-upload-text">
+                {uploading ? '正在上传...' : '点击或拖拽论文文件到此处'}
+              </p>
+              <p className="ant-upload-hint">
+                支持 PDF、DOCX、TXT 格式，最大文件大小 100MB
+              </p>
+            </Upload.Dragger>
+            {uploading && (
+              <div style={{ marginTop: '16px' }}>
+                <Progress percent={50} status="active" />
+              </div>
+            )}
+          </Card>
+        </Col>
+
+        <Col span={24}>
+          <Card
+            title={
+              <Space>
+                <span>论文列表</span>
+                <Button
+                  icon={<ReloadOutlined />}
+                  onClick={handleRefresh}
+                  size="small"
+                />
+                <Tag color="blue">总数: {papers.length}</Tag>
+              </Space>
+            }
+          >
+            <Table
+              columns={columns}
+              dataSource={papers}
+              rowKey="id"
+              loading={loading}
+              pagination={{ pageSize: 10 }}
+              locale={{
+                emptyText: '暂无论文，请上传一篇学术论文开始分析',
+              }}
+            />
+          </Card>
+        </Col>
+
+        <Col span={24}>
+          <PaperComparison
+            papers={papers}
+            onRefresh={loadPapers}
+          />
+        </Col>
+      </Row>
+
+      {renderDetailModal()}
+    </div>
+  );
+};
+
+export default PaperReproductionPage;

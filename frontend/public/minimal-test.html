@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Minimal Module Test</title>
+</head>
+<body>
+    <h1>Minimal Module Test</h1>
+    <div id="output"></div>
+    
+    <script type="module">
+        console.log('Minimal ES module executing...');
+        document.getElementById('output').innerHTML = 
+            '<p style="color: green;">✅ ES Module is working!</p>';
+        
+        // Test dynamic import
+        import('/src/main-simple-test.js').then(() => {
+            console.log('Dynamic import succeeded');
+        }).catch(err => {
+            console.error('Dynamic import failed:', err);
+            document.getElementById('output').innerHTML += 
+                '<p style="color: red;">❌ Dynamic import failed: ' + err.message + '</p>';
+        });
+    </script>
+</body>
+</html>

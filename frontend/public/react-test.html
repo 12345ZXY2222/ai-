@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>React Module Test</title>
+</head>
+<body>
+    <h1>React Module Test</h1>
+    <div id="root"></div>
+    
+    <script type="module">
+        console.log('Testing React module import...');
+        
+        import('/src/react-simple-test.jsx').then(module => {
+            console.log('React module loaded successfully:', module);
+            document.body.innerHTML += '<p style="color: green;">✅ React module loaded!</p>';
+        }).catch(err => {
+            console.error('Failed to load React module:', err);
+            document.body.innerHTML += '<p style="color: red;">❌ React module failed: ' + err.message + '</p>';
+        });
+    </script>
+</body>
+</html>

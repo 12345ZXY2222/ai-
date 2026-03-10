@@ -1,0 +1,168 @@
+import React from 'react';
+import { BrowserRouter as Router, Routes, Route, Link, Navigate, useLocation } from 'react-router-dom';
+import { Layout, Menu, Button } from 'antd';
+import AgentList from './pages/AgentList';
+import CreateAgent from './pages/CreateAgent';
+import RelationshipManager from './pages/RelationshipManager';
+import AgentDetail from './pages/AgentDetail';
+import SimulationDesigner from './pages/SimulationDesigner';
+import WorldDesigner from './pages/WorldDesigner';
+import PaperReproductionPage from './pages/PaperReproductionPage';
+import Login from './pages/Login';
+import Register from './pages/Register';
+import { AuthProvider, useAuth } from './context/AuthContext';
+import { SimulationProvider } from './context/SimulationContext';
+
+const { Header, Content, Footer } = Layout;
+
+// Temporary: Disable authentication check
+const PrivateRoute: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+    // TODO: Re-enable authentication later
+    // const { token } = useAuth();
+    // const location = useLocation();
+
+    // if (!token) {
+    //     return <Navigate to="/login" state={{ from: location }} replace />;
+    // }
+
+    return <>{children}</>;
+};
+
+const AppLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+    const { logout, isAuthenticated } = useAuth();
+    const location = useLocation();
+    
+    const getSelectedKey = () => {
+        if (location.pathname === '/') return ['1'];
+        if (location.pathname.startsWith('/agent')) return ['1'];
+        if (location.pathname === '/relationships') return ['2'];
+        if (location.pathname === '/simulation') return ['3'];
+        if (location.pathname === '/world') return ['4'];
+        if (location.pathname === '/papers') return ['5'];
+        return ['1'];
+    };
+
+    const menuItems = [
+        { key: '1', label: <Link to="/">Agents</Link> },
+        { key: '2', label: <Link to="/relationships">Relationships</Link> },
+        { key: '3', label: <Link to="/simulation">Simulation</Link> },
+        { key: '4', label: <Link to="/world">World</Link> },
+        { key: '5', label: <Link to="/papers">Papers</Link> },
+    ];
+
+    return (
+        <Layout style={{ minHeight: '100vh' }}>
+            <Header style={{ display: 'flex', alignItems: 'center' }}>
+                <div style={{ 
+                    color: 'white', 
+                    fontSize: '18px', 
+                    fontWeight: 'bold', 
+                    marginRight: '24px',
+                    minWidth: '200px'
+                }}>
+                    AI Simulation Platform
+                </div>
+                <Menu
+                    theme="dark"
+                    mode="horizontal"
+                    selectedKeys={getSelectedKey()}
+                    items={menuItems}
+                    style={{ flex: 1 }}
+                />
+                {isAuthenticated ? (
+                    <Button type="link" style={{ color: 'white' }} onClick={logout}>
+                        Logout
+                    </Button>
+                ) : (
+                    <div>
+                        <Link to="/login">
+                            <Button type="link" style={{ color: 'white', marginRight: '8px' }}>
+                                Login
+                            </Button>
+                        </Link>
+                        <Link to="/register">
+                            <Button type="link" style={{ color: 'white' }}>
+                                Register
+                            </Button>
+                        </Link>
+                    </div>
+                )}
+            </Header>
+            
+            <Content style={{ padding: '0 50px', marginTop: '16px' }}>
+                <div style={{ 
+                    background: 'white', 
+                    padding: '24px', 
+                    minHeight: 'calc(100vh - 134px)',
+                    borderRadius: '8px'
+                }}>
+                    {children}
+                </div>
+            </Content>
+            
+            <Footer style={{ textAlign: 'center' }}>
+                AI Simulation Platform ©{new Date().getFullYear()}
+            </Footer>
+        </Layout>
+    );
+};
+
+const App: React.FC = () => {
+    return (
+        <Router>
+            <AuthProvider>
+                <SimulationProvider>
+                    <AppLayout>
+                        <Routes>
+                            {/* Public routes */}
+                            <Route path="/login" element={<Login />} />
+                            <Route path="/register" element={<Register />} />
+                            
+                            {/* Protected routes */}
+                            <Route path="/" element={
+                                <PrivateRoute>
+                                    <AgentList />
+                                </PrivateRoute>
+                            } />
+                            <Route path="/create" element={
+                                <PrivateRoute>
+                                    <CreateAgent />
+                                </PrivateRoute>
+                            } />
+                            <Route path="/agent/:id" element={
+                                <PrivateRoute>
+                                    <AgentDetail />
+                                </PrivateRoute>
+                            } />
+                            <Route path="/relationships" element={
+                                <PrivateRoute>
+                                    <RelationshipManager />
+                                </PrivateRoute>
+                            } />
+                            <Route path="/simulation" element={
+                                <PrivateRoute>
+                                    <SimulationDesigner />
+                                </PrivateRoute>
+                            } />
+                            <Route path="/world" element={
+                                <PrivateRoute>
+                                    <WorldDesigner />
+                                </PrivateRoute>
+                            } />
+                            <Route path="/papers" element={
+                                <PrivateRoute>
+                                    <PaperReproductionPage />
+                                </PrivateRoute>
+                            } />
+                            
+                            {/* Default redirect */}
+                            <Route path="*" element={<Navigate to="/" replace />} />
+                        </Routes>
+                    </AppLayout>
+                </SimulationProvider>
+            </AuthProvider>
+        </Router>
+    );
+};
+
+export default App;
